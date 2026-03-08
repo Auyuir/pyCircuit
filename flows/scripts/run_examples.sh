@@ -113,35 +113,6 @@ if ports.get("a") != "in_a":
 if ports.get("b.c") != "in_b_c":
     raise SystemExit(f"ports['b.c'] mismatch: got {ports.get('b.c')!r} exp 'in_b_c'")
 
-# Probe hardening (Decision 0132/0140): probe_table must include stable at/tags.
-probe_table = payload.get("probe_table", {})
-if not isinstance(probe_table, dict):
-    raise SystemExit("missing probe_table in hardened payload")
-
-def check_probe(port, exp_ty, exp_field):
-    meta = probe_table.get(port)
-    if not isinstance(meta, dict):
-        raise SystemExit(f"missing probe_table entry for {port!r}")
-    if meta.get("at") != "tick":
-        raise SystemExit(f"{port}: expected at='tick', got {meta.get('at')!r}")
-    if meta.get("ty") != exp_ty:
-        raise SystemExit(f"{port}: expected ty={exp_ty!r}, got {meta.get('ty')!r}")
-    tags = meta.get("tags", {})
-    if not isinstance(tags, dict):
-        raise SystemExit(f"{port}: missing tags dict")
-    if tags.get("family") != "pv":
-        raise SystemExit(f"{port}: expected tags.family='pv', got {tags.get('family')!r}")
-    if tags.get("stage") != "ex":
-        raise SystemExit(f"{port}: expected tags.stage='ex', got {tags.get('stage')!r}")
-    if tags.get("lane") != 0:
-        raise SystemExit(f"{port}: expected tags.lane=0, got {tags.get('lane')!r}")
-    if tags.get("field") != exp_field:
-        raise SystemExit(f"{port}: expected tags.field={exp_field!r}, got {tags.get('field')!r}")
-    if tags.get("demo") != "bundle":
-        raise SystemExit(f"{port}: expected tags.demo='bundle', got {tags.get('demo')!r}")
-
-check_probe("dbg__pv_ex_in.a_lane0_ex", "i8", "in.a")
-check_probe("dbg__pv_ex_in.b.c_lane0_ex", "i1", "in.b.c")
 print("ok: hardened layout metadata present and stable")
 PY
     then
@@ -160,21 +131,6 @@ PY
     pyc_warn "pycc failed: ${bn}"
     fail=1
     continue
-  fi
-
-  if [[ "${bn}" == "bundle_probe_expand" ]]; then
-    pyc_log "[${count}] check M4 canonical DFX field paths ${bn}"
-    h="${cpp_dir}/bundle_probe_expand.hpp"
-    if [[ ! -f "${h}" ]]; then
-      pyc_warn "missing generated header for canonical DFX check: ${h}"
-      fail=1
-      continue
-    fi
-    if ! grep -Fq "dbg__pv_ex_in.b.c_lane0_ex" "${h}"; then
-      pyc_warn "missing dotted canonical field path in generated C++ DFX strings (Decision 0143): ${bn}"
-      fail=1
-      continue
-    fi
   fi
 
   # Basic artifact check.
@@ -294,8 +250,8 @@ plan = json.loads((out_root / "trace_plan.json").read_text(encoding="utf-8"))
 
 sig = plan.get("enabled_signals", [])
 if sig != [
-    "dut.u0:dbg__pv_leaf_q_lane0_leaf",
     "dut.u0:out_y",
+    "dut.u0:probe.pv.q",
 ]:
     raise SystemExit(f"enabled_signals mismatch: got {sig!r}")
 
@@ -317,14 +273,17 @@ for exp in sig:
     ent = by_path.get(exp, {})
     kind = str(ent.get("kind", ""))
     subkind = str(ent.get("subkind", ""))
-    if kind != "state" or subkind != "reg":
+    if exp.endswith(":out_y"):
+        want = ("state", "reg")
+    else:
+        want = ("comb", "wire")
+    if (kind, subkind) != want:
         raise SystemExit(
-            f"expected probe_manifest kind='state' subkind='reg' for {exp!r}, got kind={kind!r} subkind={subkind!r}"
+            f"expected probe_manifest kind/subkind={want!r} for {exp!r}, got kind={kind!r} subkind={subkind!r}"
         )
 
-# Decision 0140: probe_manifest must preserve hardened probe obs-point + tags
-# for debug/probe ports.
-pv = by_path.get("dut.u0:dbg__pv_leaf_q_lane0_leaf", {})
+# Decision 0140: probe_manifest must preserve resolved @probe obs-point + tags.
+pv = by_path.get("dut.u0:probe.pv.q", {})
 if str(pv.get("obs", "")) != "tick":
     raise SystemExit(f"expected obs='tick' for pv probe, got {pv.get('obs')!r}")
 tags = pv.get("tags", None)
@@ -336,10 +295,6 @@ if tags.get("stage") != "leaf":
     raise SystemExit(f"expected tags.stage='leaf', got {tags.get('stage')!r}")
 if tags.get("lane") != 0:
     raise SystemExit(f"expected tags.lane=0, got {tags.get('lane')!r}")
-if tags.get("field") != "q":
-    raise SystemExit(f"expected tags.field='q', got {tags.get('field')!r}")
-if tags.get("kind") != "probe":
-    raise SystemExit(f"expected tags.kind='probe', got {tags.get('kind')!r}")
 
 w = plan.get("window", {})
 if w.get("begin_cycle") != 1 or w.get("end_cycle") != 3:
@@ -447,16 +402,32 @@ plan = json.loads((out_root / "trace_plan.json").read_text(encoding="utf-8"))
 
 sig = plan.get("enabled_signals", [])
 if sig != [
-    "dut:dbg__pv_ex_in.a_lane0_ex",
-    "dut:dbg__pv_ex_in.b.c_lane0_ex",
+    "dut:probe.pv.in.a",
+    "dut:probe.pv.in.b.c",
 ]:
     raise SystemExit(f"enabled_signals mismatch: got {sig!r}")
 
 probe = json.loads((out_root / "probe_manifest.json").read_text(encoding="utf-8"))
-paths = [p.get("canonical_path", "") for p in probe.get("probes", []) if isinstance(p, dict)]
+entries = [p for p in probe.get("probes", []) if isinstance(p, dict)]
+paths = [p.get("canonical_path", "") for p in entries]
 for exp in sig:
     if exp not in paths:
         raise SystemExit(f"probe_manifest missing canonical_path: {exp!r}")
+by_path = {str(p.get("canonical_path", "")): p for p in entries}
+for exp in sig:
+    ent = by_path.get(exp, {})
+    if str(ent.get("obs", "")) != "tick":
+        raise SystemExit(f"expected obs='tick' for {exp!r}, got {ent.get('obs')!r}")
+    tags = ent.get("tags", None)
+    if not isinstance(tags, dict):
+        raise SystemExit(f"expected tags dict for {exp!r}")
+    if tags.get("demo") != "bundle":
+        raise SystemExit(f"expected tags.demo='bundle' for {exp!r}, got {tags.get('demo')!r}")
+
+cpp = out_root / "device" / "cpp" / "bundle_probe_expand" / "bundle_probe_expand.cpp"
+txt = cpp.read_text(encoding="utf-8")
+if 'dut:probe.pv.in.b.c' not in txt:
+    raise SystemExit("missing dotted canonical probe alias string in generated C++")
 
 tb_pyc = out_root / "tb" / "tb_bundle_probe_expand.pyc"
 mlir = tb_pyc.read_text(encoding="utf-8")
@@ -474,13 +445,13 @@ for line in mlir.splitlines():
 if payload_json is None:
     raise SystemExit("failed to extract pyc.tb.payload JSON string")
 payload = json.loads(payload_json)
-sv = payload.get("sv_text", "")
-if "dut.dbg__pv_ex_in_a_lane0_ex" not in sv:
-    raise SystemExit("missing sanitized SV trace for dbg__pv_ex_in.a_lane0_ex")
-if "dut.dbg__pv_ex_in_b_c_lane0_ex" not in sv:
-    raise SystemExit("missing sanitized SV trace for dbg__pv_ex_in.b.c_lane0_ex")
+probes = payload.get("probes", [])
+probe_paths = {str(p.get("canonical_path", "")) for p in probes if isinstance(p, dict)}
+for exp in sig:
+    if exp not in probe_paths:
+        raise SystemExit(f"tb payload missing probe handle: {exp!r}")
 
-print("ok: trace DSL preserves dotted field paths and SV mapping is sanitized")
+print("ok: trace DSL preserves dotted probe field paths and TB payload probe handles")
 PY
     then
       pyc_warn "M4 trace DSL dotted-field-path check failed: ${bex}"

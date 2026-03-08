@@ -189,6 +189,36 @@ def testbench(_fn: Any | None = None, *, name: str | None = None) -> Callable[[A
     return deco(_fn)
 
 
+def probe(
+    _fn: Any | None = None,
+    *,
+    target: Any,
+    name: str | None = None,
+) -> Callable[[Any], Any] | Any:
+    """Mark a Python function as a frontend-only probe definition.
+
+    `@probe` is not lowered as hardware. It is resolved after the target
+    `@module` hierarchy has been compiled into a final probe catalog.
+    """
+
+    if getattr(target, "__pycircuit_kind__", None) != "module":
+        raise DesignError("@probe target must be a function decorated with @module")
+
+    def deco(fn: Any) -> Any:
+        probe_name = str(name).strip() if isinstance(name, str) and name.strip() else getattr(fn, "__name__", "probe")
+        setattr(fn, "__pycircuit_probe_name__", str(probe_name))
+        setattr(fn, "__pycircuit_probe_target__", target)
+        setattr(fn, "__pycircuit_kind__", "probe")
+        setattr(fn, "__pycircuit_inline__", False)
+        setattr(fn, "__pycircuit_emit_structural__", False)
+        setattr(fn, "__pycircuit_value_params__", {})
+        return fn
+
+    if _fn is None:
+        return deco
+    return deco(_fn)
+
+
 def _canon_param(v: Any, *, path: str) -> Any:
     # Deterministic, JSON-compatible subset (Decision 0139/0144).
     if v is None:
@@ -398,6 +428,8 @@ class Design:
                     "name": sym,
                     "pyc": f"{module_dir_rel}/{sym}.pyc",
                     "params_hash": params_hash,
+                    "params_json": cm.params_json,
+                    "base": _base_name(cm.fn),
                     "deps": deps,
                     "arg_names": list(cm.arg_names),
                     "arg_types": list(cm.arg_types),

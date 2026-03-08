@@ -213,7 +213,7 @@ PY
       if ! python3 "${PYC_ROOT_DIR}/flows/tools/dump_pyctrace.py" "${tr}" --manifest "${out_dir}/probe_manifest.json" --max-cycles 10 --max-events 50 --no-header | grep -Fq "(commit)"; then
         pyc_die "trace gate: expected commit-phase value changes for ${name}: ${tr}"
       fi
-      if ! python3 "${PYC_ROOT_DIR}/flows/tools/dump_pyctrace.py" "${tr}" --manifest "${out_dir}/probe_manifest.json" --max-cycles 10 --max-events 50 --no-header | grep -Fq "(tick) dut.u0:dbg__pv_leaf_q_lane0_leaf"; then
+      if ! python3 "${PYC_ROOT_DIR}/flows/tools/dump_pyctrace.py" "${tr}" --manifest "${out_dir}/probe_manifest.json" --max-cycles 10 --max-events 50 --no-header | grep -Fq "(tick) dut.u0:probe.pv.q"; then
         pyc_die "trace gate: expected tick-phase value changes for pv probe in ${name}: ${tr}"
       fi
       if ! python3 "${PYC_ROOT_DIR}/flows/tools/dump_pyctrace.py" "${tr}" --manifest "${out_dir}/probe_manifest.json" --max-cycles 10 --max-events 200 --no-header | grep -Eq "^cycle 3: 0 value-change events, [1-9][0-9]* write events$"; then

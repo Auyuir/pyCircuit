@@ -5,6 +5,8 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <string>
+
 namespace pyc {
 
 struct CppEmitterOptions {
@@ -22,6 +24,7 @@ struct CppEmitterOptions {
   // Chunk fused comb helpers to avoid single mega-functions that dominate
   // downstream C++ TU cost even after file sharding.
   unsigned combChunkNodes = 256;
+  std::string probePlanPath{};
 };
 
 ::mlir::LogicalResult emitCpp(::mlir::ModuleOp module, ::llvm::raw_ostream &os,

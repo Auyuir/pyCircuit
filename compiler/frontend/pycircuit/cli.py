@@ -20,6 +20,14 @@ from .diagnostics import render_diagnostic
 from .dsl import Module
 from .design import FRONTEND_CONTRACT, Design, DesignError, value_params_of
 from .jit import JitError, compile
+from .probe import (
+    ProbeError,
+    TbProbes,
+    build_resolved_probe_manifest,
+    collect_probe_functions,
+    load_probe_catalog,
+    resolve_probe_function,
+)
 from .tb import Tb, TbError, _sanitize_id
 from .testbench import emit_testbench_pyc, testbench_payload_from_tb
 from .trace_dsl import (
@@ -1117,7 +1125,13 @@ def _emit_multi_pyc_artifacts(design: Design, *, out_dir: Path) -> tuple[Path, d
     return (manifest_path, manifest, module_paths, design_pyc_path)
 
 
-def _collect_testbench_payload(mod: object, iface: _TopIface, *, trace_plan: TracePlan | None = None) -> tuple[str, str]:
+def _collect_testbench_payload(
+    mod: object,
+    iface: _TopIface,
+    *,
+    trace_plan: TracePlan | None = None,
+    tb_probes: TbProbes | None = None,
+) -> tuple[str, str]:
     if not hasattr(mod, "tb") or not callable(getattr(mod, "tb")):
         raise SystemExit("build requires `@testbench def tb(t: Tb): ...`")
     tb_fn = getattr(mod, "tb")
@@ -1125,9 +1139,15 @@ def _collect_testbench_payload(mod: object, iface: _TopIface, *, trace_plan: Tra
         raise SystemExit("build requires tb(...) to be decorated with `@testbench`")
     t = Tb()
     try:
-        tb_fn(t)
+        tb_sig = inspect.signature(tb_fn)
+        if len(tb_sig.parameters) >= 2:
+            tb_fn(t, TbProbes([]) if tb_probes is None else tb_probes)
+        else:
+            tb_fn(t)
     except TbError as e:
         raise SystemExit(f"tb() failed: {e}") from e
+    except ProbeError as e:
+        raise SystemExit(f"tb() probe access failed: {e}") from e
     payload_obj = testbench_payload_from_tb(
         top_symbol=iface.sym,
         in_raw=list(iface.in_raw),
@@ -1135,6 +1155,7 @@ def _collect_testbench_payload(mod: object, iface: _TopIface, *, trace_plan: Tra
         out_raw=list(iface.out_raw),
         out_tys=list(iface.out_tys),
         tb=t,
+        probes=tb_probes,
     )
     tb_name = getattr(tb_fn, "__pycircuit_module_name__", None)
     if not isinstance(tb_name, str) or not tb_name.strip():
@@ -1215,6 +1236,143 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
     _write_text_atomic(path, json.dumps(data, sort_keys=True, indent=2) + "\n")
 
 
+def _base_name_of(fn: Any) -> str:
+    override = getattr(fn, "__pycircuit_module_name__", None)
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    return getattr(fn, "__name__", "Module")
+
+
+def _module_params_from_manifest(manifest: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    modules = manifest.get("modules", [])
+    if not isinstance(modules, list):
+        return out
+    for raw in modules:
+        if not isinstance(raw, Mapping):
+            continue
+        sym = str(raw.get("name", "")).strip()
+        params_json = str(raw.get("params_json", "{}"))
+        if not sym:
+            continue
+        try:
+            params = json.loads(params_json)
+        except Exception:
+            params = {}
+        if isinstance(params, Mapping):
+            out[sym] = dict(params)
+        else:
+            out[sym] = {}
+    return out
+
+
+def _module_bases_from_manifest(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    modules = manifest.get("modules", [])
+    if not isinstance(modules, list):
+        return out
+    for raw in modules:
+        if not isinstance(raw, Mapping):
+            continue
+        sym = str(raw.get("name", "")).strip()
+        base = str(raw.get("base", "")).strip()
+        if not sym or not base:
+            continue
+        out.setdefault(base, []).append(sym)
+    for key in list(out.keys()):
+        out[key] = sorted(set(out[key]))
+    return out
+
+
+def _resolve_probe_outputs(
+    *,
+    mod: object,
+    manifest: Mapping[str, Any],
+    probe_catalog_path: Path,
+    out_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    catalog = load_probe_catalog(probe_catalog_path)
+    params_by_symbol = _module_params_from_manifest(manifest)
+    bases = _module_bases_from_manifest(manifest)
+    explicit_plans = []
+    probe_entries: list[dict[str, Any]] = []
+    probe_dir = out_dir / "device" / "probes"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+
+    probe_modules: list[object] = []
+    seen_module_ids: set[int] = set()
+
+    def add_probe_module(candidate: object | None) -> None:
+        if candidate is None:
+            return
+        mod_id = id(candidate)
+        if mod_id in seen_module_ids:
+            return
+        seen_module_ids.add(mod_id)
+        probe_modules.append(candidate)
+
+    add_probe_module(mod)
+    for value in vars(mod).values():
+        owner = inspect.getmodule(value) if callable(value) else None
+        if owner is not None:
+            add_probe_module(owner)
+
+    seen_probe_fns: set[int] = set()
+    probe_fns: list[Any] = []
+    for probe_mod in probe_modules:
+        for probe_fn in collect_probe_functions(probe_mod):
+            probe_id = id(probe_fn)
+            if probe_id in seen_probe_fns:
+                continue
+            seen_probe_fns.add(probe_id)
+            probe_fns.append(probe_fn)
+
+    for probe_fn in probe_fns:
+        target_fn = getattr(probe_fn, "__pycircuit_probe_target__", None)
+        if target_fn is None:
+            raise SystemExit(f"invalid @probe without target: {getattr(probe_fn, '__name__', probe_fn)!r}")
+        target_base = _base_name_of(target_fn)
+        target_symbols = bases.get(target_base, [])
+        plan = resolve_probe_function(
+            probe_fn,
+            catalog=catalog,
+            target_base=target_base,
+            target_symbols=target_symbols,
+            params_by_symbol=params_by_symbol,
+        )
+        explicit_plans.append(plan)
+        rel = Path("device") / "probes" / f"{plan.name}.json"
+        _save_json(out_dir / rel, plan.as_dict())
+        probe_entries.append(
+            {
+                "name": plan.name,
+                "target_base": target_base,
+                "target_symbols": list(plan.target_symbols),
+                "json": str(rel),
+                "leaf_count": len(plan.leaves),
+            }
+        )
+
+    probe_manifest = build_resolved_probe_manifest(
+        top=str(manifest.get("top", "")),
+        root_instance="dut",
+        explicit_plans=explicit_plans,
+        catalog=catalog,
+    )
+    probe_plan = {
+        "version": 1,
+        "top_symbol": str(manifest.get("top", "")),
+        "aliases": [
+            {"canonical_path": leaf.canonical_path, "source_path": leaf.source_path}
+            for plan in explicit_plans
+            for leaf in plan.leaves
+        ],
+    }
+    probe_plan_path = out_dir / "probe_plan.json"
+    _save_json(probe_plan_path, probe_plan)
+    return (probe_manifest, {"version": 1, "probes": probe_entries}, probe_plan_path)
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     src = Path(args.python_file).resolve()
     out_dir = Path(args.out_dir).resolve()
@@ -1284,45 +1442,14 @@ def _cmd_build(args: argparse.Namespace) -> int:
         manifest_path, manifest, module_paths, design_pyc_path = _emit_multi_pyc_artifacts(design, out_dir=out_dir)
         print("jit-cache: miss")
 
-    trace_plan: TracePlan | None = None
-    trace_cfg_path = getattr(args, "trace_config", None)
-    if trace_cfg_path is not None:
-        raw = str(trace_cfg_path).strip()
-        if raw:
-            try:
-                cfg = load_trace_config(Path(raw))
-                if design is None:
-                    trace_plan = compute_trace_plan_from_artifacts(
-                        manifest=manifest,
-                        module_paths=module_paths,
-                        config=cfg,
-                    )
-                else:
-                    trace_plan = compute_trace_plan(design=design, config=cfg)
-            except TraceConfigError as e:
-                raise SystemExit(f"trace config error: {e}") from e
-
     pycc = _detect_pycc()
     jobs = max(1, int(args.jobs))
     if int(args.logic_depth) <= 0:
         raise SystemExit("--logic-depth must be > 0")
     logic_depth = int(args.logic_depth)
 
-    tb_name, tb_payload_json = _collect_testbench_payload(mod, iface, trace_plan=trace_plan)
-    tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
-    manifest["testbench"] = {"name": tb_name, "pyc": str(tb_pyc_path.relative_to(out_dir))}
-    if trace_plan is not None:
-        trace_path = out_dir / "trace_plan.json"
-        _save_json(trace_path, trace_plan.as_dict())
-        manifest["trace_plan"] = str(trace_path.relative_to(out_dir))
-
-    old_hashes = dict(cache.get("module_hashes", {}))
-    module_hashes: dict[str, str] = {}
-
     device_cpp_root = out_dir / "device" / "cpp"
     device_v_root = out_dir / "device" / "verilog"
-    tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
-    tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
     device_cpp_root.mkdir(parents=True, exist_ok=True)
     device_v_root.mkdir(parents=True, exist_ok=True)
 
@@ -1349,32 +1476,78 @@ def _cmd_build(args: argparse.Namespace) -> int:
     build_flags_hash = _canonical_hash(build_flags)
     same_flags = str(cache.get("build_flags_hash", "")) == build_flags_hash
 
-    # Decision 0097/0100: generate an external probe manifest from finalized IR
-    # (owned by IR lowering, not Python or C++ runtime).
-    probe_manifest_path = out_dir / "probe_manifest.json"
-    manifest["probe_manifest"] = str(probe_manifest_path.relative_to(out_dir))
-
     design_key = "__design_pyc"
+    old_hashes = dict(cache.get("module_hashes", {}))
+    module_hashes: dict[str, str] = {}
     design_hash = _module_hash(design_pyc_path)
     module_hashes[design_key] = design_hash
-    probe_ready = probe_manifest_path.is_file()
+    probe_catalog_path = out_dir / "device" / "probe_catalog.json"
+    probe_catalog_ready = probe_catalog_path.is_file()
     probe_unchanged = same_flags and old_hashes.get(design_key) == design_hash
     pycc_jobs: list[tuple[str, list[str]]] = []
-    if not (probe_unchanged and probe_ready):
+    if not (probe_unchanged and probe_catalog_ready):
         pycc_jobs.append(
             (
-                "probe-manifest",
+                "probe-catalog",
                 [
                     str(pycc),
                     str(design_pyc_path),
                     "--emit=none",
                     *pycc_hard_hierarchy_flags,
                     "--probe-manifest",
-                    str(probe_manifest_path),
+                    str(probe_catalog_path),
                     f"--logic-depth={logic_depth}",
                 ],
             )
         )
+    if pycc_jobs:
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futs = {pool.submit(_run_backend_job, j): j[0] for j in pycc_jobs}
+            for fut in as_completed(futs):
+                _ = fut.result()
+        pycc_jobs = []
+
+    try:
+        probe_manifest_obj, probe_section, probe_plan_path = _resolve_probe_outputs(
+            mod=mod,
+            manifest=manifest,
+            probe_catalog_path=probe_catalog_path,
+            out_dir=out_dir,
+        )
+    except ProbeError as e:
+        raise SystemExit(f"probe resolution failed: {e}") from e
+    probe_manifest_path = out_dir / "probe_manifest.json"
+    _save_json(probe_manifest_path, probe_manifest_obj)
+    manifest["probe_manifest"] = str(probe_manifest_path.relative_to(out_dir))
+    manifest["probes"] = list(probe_section.get("probes", []))
+
+    trace_plan: TracePlan | None = None
+    trace_cfg_path = getattr(args, "trace_config", None)
+    if trace_cfg_path is not None:
+        raw = str(trace_cfg_path).strip()
+        if raw:
+            try:
+                cfg = load_trace_config(Path(raw))
+                trace_plan = compute_trace_plan_from_artifacts(
+                    manifest=manifest,
+                    module_paths=module_paths,
+                    config=cfg,
+                    probe_manifest=probe_manifest_obj,
+                )
+            except TraceConfigError as e:
+                raise SystemExit(f"trace config error: {e}") from e
+
+    tb_probes = TbProbes.from_probe_manifest(probe_manifest_obj)
+    tb_name, tb_payload_json = _collect_testbench_payload(mod, iface, trace_plan=trace_plan, tb_probes=tb_probes)
+    tb_pyc_path = _emit_testbench_pyc_file(out_dir=out_dir, tb_name=tb_name, payload_json=tb_payload_json)
+    manifest["testbench"] = {"name": tb_name, "pyc": str(tb_pyc_path.relative_to(out_dir))}
+    if trace_plan is not None:
+        trace_path = out_dir / "trace_plan.json"
+        _save_json(trace_path, trace_plan.as_dict())
+        manifest["trace_plan"] = str(trace_path.relative_to(out_dir))
+
+    tb_cpp_out = out_dir / "tb" / f"{tb_name}.cpp"
+    tb_sv_out = out_dir / "tb" / f"{tb_name}.sv"
     for sym in sorted(module_paths.keys()):
         mp = module_paths[sym]
         h = _module_hash(mp)
@@ -1396,6 +1569,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
                         "--out-dir",
                         str(cpp_out_dir),
                         "--cpp-split=module",
+                        "--probe-plan",
+                        str(probe_plan_path),
                         f"--logic-depth={logic_depth}",
                     ],
                 )

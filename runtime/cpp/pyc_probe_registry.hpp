@@ -354,6 +354,23 @@ public:
                    /*write_mask_width_bits=*/MaskW);
   }
 
+  std::uint64_t addAlias(std::string path, const Entry &src) {
+    return addImpl(std::move(path),
+                   src.kind,
+                   src.width_bits,
+                   src.ptr,
+                   src.write_valid,
+                   src.write_data_ptr,
+                   src.write_width_bits,
+                   src.write_addr,
+                   src.write_mask_ptr,
+                   src.write_mask_width_bits,
+                   src.known_mask_ptr,
+                   src.known_mask_width_bits,
+                   src.z_mask_ptr,
+                   src.z_mask_width_bits);
+  }
+
   const Entry *findByPath(std::string_view path) const {
     // Decision 0022: if a path's base hash collides, its id is rehashed with a
     // numeric suffix (path + "#<n>"). To find an entry by path, walk the same

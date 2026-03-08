@@ -290,6 +290,7 @@ class Module:
         result_types: list[str],
         name: str | None = None,
         short_name: str | None = None,
+        keep: bool = False,
     ) -> list[Signal]:
         """Instantiate a sub-module by symbol (pyc.instance).
 
@@ -317,6 +318,8 @@ class Module:
             attrs += f', name = {json.dumps(str(name), ensure_ascii=False)}'
         if short_name is not None:
             attrs += f', short_name = {json.dumps(str(short_name), ensure_ascii=False)}'
+        if keep:
+            attrs += ", pyc.debug_keep = true"
         attrs += "}"
 
         in_ty_sig = ", ".join(s.ty for s in inputs)

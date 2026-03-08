@@ -390,6 +390,7 @@ def compute_trace_plan_from_artifacts(
     manifest: Mapping[str, Any],
     module_paths: Mapping[str, Path],
     config: TraceConfig,
+    probe_manifest: Mapping[str, Any] | None = None,
 ) -> TracePlan:
     """Compute a TracePlan using already-emitted `.pyc` artifacts + project manifest.
 
@@ -452,6 +453,7 @@ def compute_trace_plan_from_artifacts(
 
     enabled: set[str] = set()
     enabled_full_paths: set[str] = set()
+    enabled_probe_instances: set[str] = set()
     signal_obs: dict[str, str] = {}
     for ipath, sym, full_path in instances:
         ports = module_ports.get(sym, [])
@@ -477,12 +479,39 @@ def compute_trace_plan_from_artifacts(
                         if isinstance(at, str) and at.strip():
                             signal_obs[sig] = at.strip().lower()
 
+    if probe_manifest is not None:
+        raw_probes = probe_manifest.get("probes", [])
+        if isinstance(raw_probes, list):
+            for raw in raw_probes:
+                if not isinstance(raw, Mapping):
+                    continue
+                canonical_path = str(raw.get("canonical_path", "")).strip()
+                instance_path = str(raw.get("instance_path", "")).strip()
+                if not canonical_path or not instance_path:
+                    continue
+                meta: dict[str, Any] = {"at": raw.get("obs", None), "tags": raw.get("tags", {})}
+                for rule in config.rules:
+                    if rule.probes is None:
+                        continue
+                    if not any(_match_hier_glob(p, instance_path) for p in rule.instance_globs):
+                        continue
+                    if rule.probes.matches(meta):
+                        enabled.add(canonical_path)
+                        enabled_probe_instances.add(instance_path)
+                        at = raw.get("obs", None)
+                        if isinstance(at, str) and at.strip():
+                            signal_obs[canonical_path] = at.strip().lower()
+
     enabled_signals = tuple(sorted(enabled))
     signal_obs = {s: v for s, v in signal_obs.items() if s in enabled_signals}
 
     enabled_instances_set: set[str] = set()
     for full_path in enabled_full_paths:
         parts = [p for p in str(full_path).split(".") if p]
+        for i in range(1, len(parts) + 1):
+            enabled_instances_set.add(shorten_instance_path(".".join(parts[:i])))
+    for instance_path in enabled_probe_instances:
+        parts = [p for p in str(instance_path).split(".") if p]
         for i in range(1, len(parts) + 1):
             enabled_instances_set.add(shorten_instance_path(".".join(parts[:i])))
     enabled_instances = tuple(sorted(enabled_instances_set))

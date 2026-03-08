@@ -20,6 +20,7 @@ from .connectors import (
     is_connector_bundle,
     is_connector_struct,
 )
+from .design import DesignError
 from .dsl import Module, Signal
 from .literals import LiteralValue, infer_literal_width
 
@@ -800,69 +801,12 @@ class Circuit(Module):
         at: str | None = None,
         tags: Mapping[str, Any] | None = None,
     ) -> Wire:
-        """Export a named debug probe as a stable module output.
-
-        Probes are emitted as `dbg__*` outputs and consumed directly by generated
-        C++/SV testbench flows.
-        """
-        raw = str(name).strip()
-        if not raw:
-            raise ValueError("debug name must be non-empty")
-        scoped = self.scoped_name(f"dbg__{raw}")
-
-        if isinstance(value, Connector):
-            value = value.read()
-        if isinstance(value, Reg):
-            w = value.q
-            sig = w.sig
-        elif isinstance(value, Wire):
-            w = value
-            sig = value.sig
-        else:
-            sig = value
-            w = Wire(self, sig)
-
-        prev = self._debug_exports.get(scoped)
-        if prev is not None and prev is not sig:
-            raise ValueError(f"debug probe {scoped!r} already exists with a different signal")
-        at_norm = self._normalize_probe_at(at)
-        tags_norm = self._normalize_probe_tags(tags)
-        tags_norm.setdefault("kind", "probe")
-        if prev is not None:
-            meta = self._hardened_probe_table.get(scoped)
-            if meta is not None:
-                if str(meta.get("at", "")) != at_norm:
-                    raise ValueError(
-                        f"debug probe {scoped!r} already exists with at={meta.get('at')!r} (requested {at_norm!r})"
-                    )
-                prev_tags = meta.get("tags", {})
-                if isinstance(prev_tags, Mapping) and dict(prev_tags) != tags_norm:
-                    raise ValueError(f"debug probe {scoped!r} already exists with different tags")
-        if prev is None:
-            self.output(scoped, sig)
-            self._debug_exports[scoped] = sig
-            self._record_hardened_probe(
-                port=scoped,
-                meta={
-                    "at": at_norm,
-                    "tags": tags_norm,
-                    "ty": str(sig.ty),
-                },
-            )
-        return w
+        _ = (name, value, at, tags)
+        raise DesignError("Circuit.debug() was removed; use standalone `@probe(target=...)` definitions instead")
 
     def debug_bundle(self, prefix: str, fields: Mapping[str, Union[Wire, Reg, Signal, Connector]]) -> dict[str, Wire]:
-        """Export a group of debug probes using `prefix_<field>` names."""
-        raw_prefix = str(prefix).strip()
-        if not raw_prefix:
-            raise ValueError("debug bundle prefix must be non-empty")
-        out: dict[str, Wire] = {}
-        for key, value in fields.items():
-            raw_key = str(key).strip()
-            if not raw_key:
-                raise ValueError("debug bundle field name must be non-empty")
-            out[raw_key] = self.debug(f"{raw_prefix}_{raw_key}", value)
-        return out
+        _ = (prefix, fields)
+        raise DesignError("Circuit.debug_bundle() was removed; use standalone `@probe(target=...)` definitions instead")
 
     def debug_probe(
         self,
@@ -874,32 +818,12 @@ class Circuit(Module):
         at: str | None = None,
         tags: Mapping[str, Any] | None = None,
     ) -> dict[str, Wire]:
-        """Emit canonical DFX probes as `dbg__<family>_<stage>_<field>_lane<k>_<stage>`."""
-        raw_stage = str(stage).strip().lower()
-        if not raw_stage:
-            raise ValueError("debug probe stage must be non-empty")
-        if lane < 0:
-            raise ValueError("debug probe lane must be >= 0")
-        raw_family = str(family).strip().lower()
-        if not raw_family:
-            raise ValueError("debug probe family must be non-empty")
-        at_norm = self._normalize_probe_at(at)
-        base_tags = {"family": raw_family, "stage": raw_stage, "lane": int(lane)}
-        base_tags.update(self._normalize_probe_tags(tags))
-        out: dict[str, Wire] = {}
-        for key, value in fields.items():
-            raw_key = str(key).strip()
-            if not raw_key:
-                raise ValueError("debug probe field name must be non-empty")
-            name = f"{raw_family}_{raw_stage}_{raw_key}_lane{int(lane)}_{raw_stage}"
-            leaf_tags = dict(base_tags)
-            leaf_tags.setdefault("field", raw_key)
-            out[raw_key] = self.debug(name, value, at=at_norm, tags=leaf_tags)
-        return out
+        _ = (stage, lane, fields, family, at, tags)
+        raise DesignError("Circuit.debug_probe() was removed; use standalone `@probe(target=...)` definitions instead")
 
     def debug_occ(self, stage: str, lane: int, fields: Mapping[str, Union[Wire, Reg, Signal, Connector]]) -> dict[str, Wire]:
-        """Emit occupancy probes as `dbg__occ_<stage>_<field>_lane<k>_<stage>`."""
-        return self.debug_probe(stage, lane, fields, family="occ")
+        _ = (stage, lane, fields)
+        raise DesignError("Circuit.debug_occ() was removed; use standalone `@probe(target=...)` definitions instead")
 
     def probe(
         self,
@@ -912,63 +836,8 @@ class Circuit(Module):
         at: str | None = None,
         tags: Mapping[str, Any] | None = None,
     ) -> dict[str, Wire]:
-        """Probe a structured value in one call (Decision 0138).
-
-        The value may be:
-        - `ConnectorStruct` (preferred; preserves leaf-path order via its spec)
-        - `ConnectorBundle` / `Bundle`
-        - a nested `Mapping[str, ...]` of the above
-
-        Probes are expanded into per-leaf `dbg__*` outputs with stable, field-path
-        based names.
-        """
-
-        def flatten_value(v: Any, *, out: dict[str, Any], path_prefix: str = "") -> None:
-            def join(pfx: str, k: str) -> str:
-                return f"{pfx}.{k}" if pfx else k
-
-            if isinstance(v, ConnectorStruct):
-                flat = v.flatten()
-                if v.spec is not None:
-                    paths = [p for p, _ in v.spec.flatten_fields()]
-                else:
-                    paths = sorted(flat.keys())
-                for p in paths:
-                    out[join(path_prefix, p)] = flat[p]
-                return
-
-            if isinstance(v, ConnectorBundle):
-                # Preserve schema-defined order when a spec is present.
-                spec = getattr(v, "spec", None)
-                if spec is not None and hasattr(spec, "layout_fields"):
-                    paths = [p for p, _w, _s, _k in spec.layout_fields()]
-                else:
-                    paths = sorted(v.keys())
-                for p in paths:
-                    out[join(path_prefix, str(p))] = v[str(p)]
-                return
-
-            if isinstance(v, Bundle):
-                for k in sorted(v.fields.keys()):
-                    out[join(path_prefix, str(k))] = v.fields[str(k)]
-                return
-
-            if isinstance(v, Mapping):
-                for kk in sorted(v.keys(), key=lambda x: str(x)):
-                    flatten_value(v[kk], out=out, path_prefix=join(path_prefix, str(kk)))
-                return
-
-            out[path_prefix or "value"] = v
-
-        flat: dict[str, Any] = {}
-        flatten_value(value, out=flat)
-        if prefix:
-            pfx = str(prefix).strip()
-            if not pfx:
-                raise ValueError("probe prefix must be non-empty if provided")
-            flat = {f"{pfx}.{k}": v for k, v in flat.items()}
-
-        return self.debug_probe(stage, lane, flat, family=family, at=at, tags=tags)
+        _ = (value, stage, lane, family, prefix, at, tags)
+        raise DesignError("Circuit.probe() was removed; use standalone `@probe(target=...)` definitions instead")
 
     def assign(
         self,
@@ -1448,6 +1317,7 @@ class Circuit(Module):
         bind: Mapping[str, Connector | ConnectorBundle | ConnectorStruct | Mapping[str, Any] | Any],
         params: dict[str, Any] | None = None,
         module_name: str | None = None,
+        short_name: str | None = None,
     ) -> ModuleInstanceHandle:
         """Instantiate a module from connector/spec bindings."""
         from .wiring.connect import ports
@@ -1458,6 +1328,7 @@ class Circuit(Module):
             name=str(name),
             params=params,
             module_name=module_name,
+            short_name=short_name,
             **bound_ports,
         )
 
@@ -1468,6 +1339,8 @@ class Circuit(Module):
         name: str,
         params: dict[str, Any] | None = None,
         module_name: str | None = None,
+        short_name: str | None = None,
+        keep: bool = False,
         **ports: Any,
     ) -> Connector | ConnectorBundle:
         """Instantiate a module while auto-wrapping port values as connectors."""
@@ -1477,6 +1350,8 @@ class Circuit(Module):
             name=str(name),
             params=params,
             module_name=module_name,
+            short_name=short_name,
+            keep=keep,
             **wrapped,
         )
 
@@ -1649,6 +1524,8 @@ class Circuit(Module):
         name: str,
         params: dict[str, Any] | None = None,
         module_name: str | None = None,
+        short_name: str | None = None,
+        keep: bool = False,
         **ports: Any,
     ) -> ModuleInstanceHandle:
         """Instantiate a specialized sub-module and return a rich instance handle."""
@@ -1774,6 +1651,7 @@ class Circuit(Module):
             result_types=list(cm.result_types),
             name=str(name),
             short_name=None if short_name is None else str(short_name),
+            keep=bool(keep),
         )
         self._record_struct_instance()
         out_fields: dict[str, Connector] = {}
@@ -1808,6 +1686,8 @@ class Circuit(Module):
         name: str,
         params: dict[str, Any] | None = None,
         module_name: str | None = None,
+        short_name: str | None = None,
+        keep: bool = False,
         **ports: Any,
     ) -> Connector | ConnectorBundle:
         """Instantiate a specialized sub-module.
@@ -1825,6 +1705,8 @@ class Circuit(Module):
             name=name,
             params=params,
             module_name=module_name,
+            short_name=short_name,
+            keep=keep,
             **ports,
         ).outputs
 

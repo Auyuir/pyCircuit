@@ -173,6 +173,18 @@ public:
         return attr;
       };
 
+      auto checkBoolAttr = [&](StringRef name, llvm::StringRef code, llvm::StringRef hint) -> BoolAttr {
+        auto attr = f->getAttrOfType<BoolAttr>(name);
+        if (!attr) {
+          auto d = f.emitError();
+          d << "[" << code << "] missing required func attr `" << name << "`";
+          if (!hint.empty())
+            d << " (hint: " << hint << ")";
+          ok = false;
+        }
+        return attr;
+      };
+
       auto kind = checkStrAttr("pyc.kind", "PYC903", "frontend must stamp symbol kind metadata");
       auto inl = checkStrAttr("pyc.inline", "PYC904", "frontend must stamp inline metadata");
       (void)checkStrAttr("pyc.params", "PYC905", "frontend must stamp canonical specialization params");
