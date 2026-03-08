@@ -350,7 +350,7 @@ def PYC_CdcSyncOp : PYC_Op<"cdc_sync", [MemoryEffects<[MemRead, MemWrite]>, AllT
   let assemblyFormat = "$clk `,` $rst `,` $in attr-dict `:` type($out)";
 }
 
-def PYC_InstanceOp : PYC_Op<"instance", [Pure]> {
+def PYC_InstanceOp : PYC_Op<"instance", []> {
   let summary = "Instantiate a sub-module";
   let arguments = (ins Variadic<AnyType>:$inputs, FlatSymbolRefAttr:$callee, OptionalAttr<StrAttr>:$name);
   let results = (outs Variadic<AnyType>:$outputs);

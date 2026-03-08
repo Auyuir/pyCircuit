@@ -12,7 +12,10 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
@@ -155,6 +158,86 @@ static std::string getPortCanonicalFieldPath(func::FuncOp f, unsigned idx, bool 
         return s.getValue().str();
   }
   return "out" + std::to_string(idx);
+}
+
+struct ProbeAliasEntry {
+  std::string canonicalPath;
+  std::string sourcePath;
+};
+
+static std::vector<ProbeAliasEntry> loadProbeAliasesForTop(llvm::StringRef planPath, llvm::StringRef symName) {
+  std::vector<ProbeAliasEntry> out;
+  if (planPath.empty())
+    return out;
+  auto fileOrErr = llvm::MemoryBuffer::getFile(planPath);
+  if (!fileOrErr)
+    return out;
+  auto parsed = llvm::json::parse(fileOrErr.get()->getBuffer());
+  if (!parsed)
+    return out;
+  auto *obj = parsed->getAsObject();
+  if (!obj)
+    return out;
+  auto topSymbol = obj->getString("top_symbol");
+  if (!topSymbol || *topSymbol != symName)
+    return out;
+  auto *aliases = obj->getArray("aliases");
+  if (!aliases)
+    return out;
+  out.reserve(aliases->size());
+  for (const llvm::json::Value &value : *aliases) {
+    auto *entry = value.getAsObject();
+    if (!entry)
+      continue;
+    auto canonical = entry->getString("canonical_path");
+    auto source = entry->getString("source_path");
+    if (!canonical || !source)
+      continue;
+    out.push_back(ProbeAliasEntry{canonical->str(), source->str()});
+  }
+  std::sort(out.begin(), out.end(), [](const ProbeAliasEntry &a, const ProbeAliasEntry &b) {
+    return a.canonicalPath < b.canonicalPath;
+  });
+  return out;
+}
+
+static Value findRegQFromValue(Value v) {
+  llvm::SmallVector<Value, 8> seen;
+  while (true) {
+    for (Value prev : seen) {
+      if (prev == v)
+        return Value();
+    }
+    seen.push_back(v);
+    while (auto a = v.getDefiningOp<pyc::AliasOp>())
+      v = a.getIn();
+    if (auto rop = v.getDefiningOp<pyc::RegOp>())
+      return rop.getQ();
+    auto comb = v.getDefiningOp<pyc::CombOp>();
+    if (!comb)
+      return Value();
+
+    auto res = dyn_cast<OpResult>(v);
+    if (!res)
+      return Value();
+    auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+    if (!yield)
+      return Value();
+    if (res.getResultNumber() >= yield.getNumOperands())
+      return Value();
+
+    Value y = yield.getOperand(res.getResultNumber());
+    while (auto a = y.getDefiningOp<pyc::AliasOp>())
+      y = a.getIn();
+    auto barg = dyn_cast<BlockArgument>(y);
+    if (!barg)
+      return Value();
+    if (barg.getOwner() != &comb.getBody().front())
+      return Value();
+    if (barg.getArgNumber() >= comb.getNumOperands())
+      return Value();
+    v = comb.getOperand(barg.getArgNumber());
+  }
 }
 
 static void computeUniquePortNames(func::FuncOp f, std::vector<std::string> &inNames, std::vector<std::string> &outNames) {
@@ -806,57 +889,53 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	  os << "      return p;\n";
 	  os << "    };\n";
 
-    // Decision 0003 / 0051-0052: infer probe kind for module results.
-    // A result is considered stateful iff it directly returns the q output of a
-    // local pyc.reg (through optional pyc.alias wrappers).
+    struct NamedProbeInfo {
+      std::string fieldPath;
+      std::string cppValue;
+      std::string cppRegInst;
+      unsigned width = 0;
+      bool isReg = false;
+    };
+
+    // Decision 0003 / 0051-0052: infer probe kind for ports and named internal
+    // objects. A value is considered stateful iff it directly returns the q
+    // output of a local pyc.reg (through optional pyc.alias wrappers).
     std::vector<bool> outIsReg(f.getNumResults(), false);
     std::vector<Value> outRegQ(f.getNumResults(), Value());
+    std::vector<NamedProbeInfo> namedProbes;
     if (!f.isDeclaration()) {
       auto ret = dyn_cast_or_null<func::ReturnOp>(f.getBody().front().getTerminator());
       if (!ret)
         return f.emitError("missing return");
-      auto findRegQ = [&](Value v) -> Value {
-        llvm::SmallVector<Value, 8> seen;
-        while (true) {
-          for (Value prev : seen) {
-            if (prev == v)
-              return Value();
-          }
-          seen.push_back(v);
-          while (auto a = v.getDefiningOp<pyc::AliasOp>())
-            v = a.getIn();
-          if (auto rop = v.getDefiningOp<pyc::RegOp>())
-            return rop.getQ();
-          auto comb = v.getDefiningOp<pyc::CombOp>();
-          if (!comb)
-            return Value();
-
-          auto res = dyn_cast<OpResult>(v);
-          if (!res)
-            return Value();
-          auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
-          if (!yield)
-            return Value();
-          if (res.getResultNumber() >= yield.getNumOperands())
-            return Value();
-
-          Value y = yield.getOperand(res.getResultNumber());
-          while (auto a = y.getDefiningOp<pyc::AliasOp>())
-            y = a.getIn();
-          auto barg = dyn_cast<BlockArgument>(y);
-          if (!barg)
-            return Value();
-          if (barg.getOwner() != &comb.getBody().front())
-            return Value();
-          if (barg.getArgNumber() >= comb.getNumOperands())
-            return Value();
-          v = comb.getOperand(barg.getArgNumber());
-        }
-      };
       for (unsigned i = 0; i < f.getNumResults() && i < ret.getNumOperands(); ++i)
-        outRegQ[i] = findRegQ(ret.getOperand(i));
+        outRegQ[i] = findRegQFromValue(ret.getOperand(i));
       for (unsigned i = 0; i < f.getNumResults(); ++i)
         outIsReg[i] = static_cast<bool>(outRegQ[i]);
+
+      llvm::StringSet<> seenNamedFields;
+      f.walk([&](Operation *op) {
+        auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
+        if (!nameAttr || op->getNumResults() != 1)
+          return;
+        Value value = op->getResult(0);
+        unsigned width = bitWidth(value.getType());
+        if (width == 0)
+          return;
+        std::string fieldPath = nameAttr.getValue().str();
+        if (!seenNamedFields.insert(fieldPath).second)
+          return;
+        Value regQ = findRegQFromValue(value);
+        namedProbes.push_back(NamedProbeInfo{
+            fieldPath,
+            nt.get(value),
+            static_cast<bool>(regQ) ? (nt.get(regQ) + "_inst") : std::string(),
+            width,
+            static_cast<bool>(regQ),
+        });
+      });
+      std::sort(namedProbes.begin(), namedProbes.end(), [](const NamedProbeInfo &a, const NamedProbeInfo &b) {
+        return a.fieldPath < b.fieldPath;
+      });
     }
 
 		  for (auto [i, arg] : llvm::enumerate(f.getArguments())) {
@@ -877,6 +956,15 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 		      os << "    reg.addWire<" << w << ">(reg_path(" << cppStringLiteral(outCanon[i]) << "), &" << outNames[i] << ");\n";
 		    }
 		  }
+      for (const auto &named : namedProbes) {
+        if (named.isReg) {
+          os << "    reg.addReg<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
+             << named.cppValue << ", &" << named.cppRegInst << "->pending, &" << named.cppRegInst << "->qNext);\n";
+        } else {
+          os << "    reg.addWire<" << named.width << ">(reg_path(" << cppStringLiteral(named.fieldPath) << "), &"
+             << named.cppValue << ");\n";
+        }
+      }
 		  for (auto mem : byteMems) {
 		    std::string instName = nt.get(mem.getRdata()) + "_inst";
 		    if (auto nameAttr = mem->getAttrOfType<StringAttr>("name"))
@@ -911,6 +999,13 @@ static LogicalResult emitFunc(func::FuncOp f, llvm::raw_ostream &os, const CppEm
 	    for (const auto &ii : instInfos)
 	      os << "    reg_child(" << ii.member << ", \"" << ii.seg << "\");\n";
 	  }
+      auto probeAliases = loadProbeAliasesForTop(opts.probePlanPath, f.getSymName());
+      if (!probeAliases.empty()) {
+        for (const auto &alias : probeAliases) {
+          os << "    if (const auto *src = reg.findByPath(" << cppStringLiteral(alias.sourcePath) << "))\n";
+          os << "      reg.addAlias(" << cppStringLiteral(alias.canonicalPath) << ", *src);\n";
+        }
+      }
 	  os << "  }\n\n";
 
 	  for (auto r : regs) {

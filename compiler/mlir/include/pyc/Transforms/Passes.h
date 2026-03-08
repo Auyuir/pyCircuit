@@ -20,6 +20,7 @@ std::unique_ptr<::mlir::Pass> createCheckClockDomainsPass();
 std::unique_ptr<::mlir::Pass> createCheckFlatTypesPass();
 std::unique_ptr<::mlir::Pass> createPrunePortsPass();
 std::unique_ptr<::mlir::Pass> createEliminateDeadStatePass();
+std::unique_ptr<::mlir::Pass> createEliminateDeadInstancesPass();
 std::unique_ptr<::mlir::Pass> createSLPPackWiresPass();
 std::unique_ptr<::mlir::Pass> createCheckLogicDepthPass(unsigned logicDepth);
 std::unique_ptr<::mlir::Pass> createCollectCompileStatsPass();

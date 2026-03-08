@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pycircuit import Circuit, compile, module
+from pycircuit import Circuit, ProbeBuilder, ProbeView, compile, module, probe
 
 
 @module
@@ -11,11 +11,21 @@ def build(m: Circuit, width: int = 8) -> None:
 
     q = m.out("q", clk=clk, rst=rst, width=width, init=0)
     q.set(q.out() + 1, when=en)
-    m.probe({"q": q}, family="reset", stage="order", lane=0, at="tick")
     m.output("y", q)
 
 
 build.__pycircuit_name__ = "reset_invalidate_order_smoke"
+
+
+@probe(target=build, name="reset")
+def reset_probe(p: ProbeBuilder, dut: ProbeView, width: int = 8) -> None:
+    _ = width
+    p.emit(
+        "q",
+        dut.read("q"),
+        at="tick",
+        tags={"family": "reset", "stage": "order", "lane": 0},
+    )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -20,6 +21,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MD5.h"
@@ -105,6 +107,11 @@ static llvm::cl::opt<std::string> cppManifestPath(
 static llvm::cl::opt<std::string> probeManifestPath(
     "probe-manifest",
     llvm::cl::desc("Write DFX probe manifest JSON to this path (Decision 0100)"),
+    llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> probePlanPath(
+    "probe-plan",
+    llvm::cl::desc("Resolved @probe alias plan JSON to embed into generated ProbeRegistry registration"),
     llvm::cl::init(""));
 
 static llvm::cl::opt<std::string> targetKind("target", llvm::cl::desc("Target: default|fpga"),
@@ -373,6 +380,11 @@ struct ProbeManifestEntry {
   llvm::json::Value tags = nullptr;
 };
 
+struct ProbeManifestInstance {
+  std::string module{};
+  std::string instance_path{};
+};
+
 struct ProbeManifestIndex {
   llvm::StringMap<std::size_t> by_path{};
   llvm::DenseMap<std::uint64_t, std::size_t> by_id{};
@@ -397,9 +409,10 @@ static std::uint64_t assignProbeId(llvm::StringRef path, const ProbeManifestInde
 static LogicalResult writeProbeManifestJson(llvm::StringRef path,
                                            llvm::StringRef top,
                                            llvm::StringRef rootInstance,
+                                           llvm::ArrayRef<ProbeManifestInstance> instances,
                                            llvm::ArrayRef<ProbeManifestEntry> entries) {
   llvm::json::Object root;
-  root["version"] = 2;
+  root["version"] = 3;
   root["top"] = top.str();
   root["root_instance"] = rootInstance.str();
   root["probe_id_alg"] = "xxhash64(seed=0)";
@@ -415,8 +428,20 @@ static LogicalResult writeProbeManifestJson(llvm::StringRef path,
   }
   root["probe_count"] = static_cast<int64_t>(entries.size());
 
+  llvm::json::Array instJson;
+  instJson.reserve(instances.size());
+  for (const auto &inst : instances) {
+    llvm::json::Object obj;
+    obj["module"] = inst.module;
+    obj["instance_path"] = inst.instance_path;
+    instJson.push_back(std::move(obj));
+  }
+  root["instances"] = std::move(instJson);
+
   llvm::json::Array probes;
+  llvm::json::Array entriesJson;
   probes.reserve(entries.size());
+  entriesJson.reserve(entries.size());
   for (const auto &e : entries) {
     llvm::json::Object obj;
     obj["canonical_path"] = e.canonical_path;
@@ -434,8 +459,25 @@ static LogicalResult writeProbeManifestJson(llvm::StringRef path,
     if (e.tags.kind() != llvm::json::Value::Null)
       obj["tags"] = e.tags;
     probes.push_back(std::move(obj));
+    llvm::json::Object obj2;
+    obj2["canonical_path"] = e.canonical_path;
+    obj2["probe_id"] = u64Hex(e.probe_id);
+    obj2["kind"] = e.kind;
+    obj2["subkind"] = e.subkind;
+    obj2["dir"] = e.dir;
+    obj2["width_bits"] = static_cast<int64_t>(e.width_bits);
+    obj2["ty"] = e.ty;
+    obj2["module"] = e.module;
+    obj2["instance_path"] = e.instance_path;
+    obj2["field_path"] = e.field_path;
+    if (e.obs.has_value())
+      obj2["obs"] = *e.obs;
+    if (e.tags.kind() != llvm::json::Value::Null)
+      obj2["tags"] = e.tags;
+    entriesJson.push_back(std::move(obj2));
   }
   root["probes"] = std::move(probes);
+  root["entries"] = std::move(entriesJson);
 
   std::string buf;
   llvm::raw_string_ostream ss(buf);
@@ -463,6 +505,9 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
   ProbeManifestIndex idx;
   std::vector<ProbeManifestEntry> entries;
   entries.reserve(1024);
+  std::vector<ProbeManifestInstance> instances;
+  instances.reserve(128);
+  llvm::StringSet<> instanceSeen;
 
   llvm::SmallVector<std::string> stack;
   stack.reserve(16);
@@ -489,6 +534,8 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
     stack.push_back(sym);
 
     const std::string canonInstPath = pyc::cpp::shortenInstancePath(instPath);
+    if (instanceSeen.insert(canonInstPath).second)
+      instances.push_back(ProbeManifestInstance{sym, canonInstPath});
 
     struct HardenedProbeMeta {
       std::string at{};
@@ -610,10 +657,78 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
       return success();
     }
 
+    auto findRegQ = [&](Value v) -> Value {
+      llvm::SmallVector<Value, 8> seen;
+      while (true) {
+        for (Value prev : seen) {
+          if (prev == v)
+            return Value();
+        }
+        seen.push_back(v);
+        while (auto a = v.getDefiningOp<pyc::AliasOp>())
+          v = a.getIn();
+        if (auto rop = v.getDefiningOp<pyc::RegOp>())
+          return rop.getQ();
+        auto comb = v.getDefiningOp<pyc::CombOp>();
+        if (!comb)
+          return Value();
+
+        auto res = dyn_cast<OpResult>(v);
+        if (!res)
+          return Value();
+        auto yield = dyn_cast_or_null<pyc::YieldOp>(comb.getBody().front().getTerminator());
+        if (!yield)
+          return Value();
+        if (res.getResultNumber() >= yield.getNumOperands())
+          return Value();
+
+        Value y = yield.getOperand(res.getResultNumber());
+        while (auto a = y.getDefiningOp<pyc::AliasOp>())
+          y = a.getIn();
+        auto barg = dyn_cast<BlockArgument>(y);
+        if (!barg)
+          return Value();
+        if (barg.getOwner() != &comb.getBody().front())
+          return Value();
+        if (barg.getArgNumber() >= comb.getNumOperands())
+          return Value();
+        v = comb.getOperand(barg.getArgNumber());
+      }
+    };
+
     if (!llvm::hasSingleElement(f.getBody()))
       return f.emitError("[PYC973] probe manifest emission requires single-block funcs (match C++ emitter contract)");
 
     Block &topBlock = f.getBody().front();
+
+    llvm::StringSet<> localNamedFields;
+    f.walk([&](Operation *op) {
+      auto nameAttr = op->getAttrOfType<StringAttr>("pyc.name");
+      if (!nameAttr)
+        return;
+      if (op->getNumResults() != 1)
+        return;
+      Value value = op->getResult(0);
+      const unsigned width = bitWidth(value.getType());
+      if (width == 0)
+        return;
+      const std::string fieldPath = nameAttr.getValue().str();
+      if (!localNamedFields.insert(fieldPath).second)
+        return;
+
+      ProbeManifestEntry e;
+      e.instance_path = canonInstPath;
+      e.field_path = fieldPath;
+      e.canonical_path = canonInstPath + ":" + e.field_path;
+      e.module = sym;
+      const bool isReg = static_cast<bool>(findRegQ(value));
+      e.kind = isReg ? "state" : "comb";
+      e.subkind = isReg ? "reg" : "wire";
+      e.dir = "internal";
+      e.width_bits = width;
+      e.ty = typeToString(value.getType());
+      (void)addEntry(std::move(e));
+    });
 
     auto collectMemNames = [&](auto pred) -> std::vector<std::string> {
       std::vector<std::string> out;
@@ -722,7 +837,7 @@ static LogicalResult emitProbeManifest(ModuleOp module, llvm::StringRef outPath)
     return a.canonical_path < b.canonical_path;
   });
 
-  return writeProbeManifestJson(outPath, top, "dut", entries);
+  return writeProbeManifestJson(outPath, top, "dut", instances, entries);
 }
 
 static std::optional<std::string> getTbPayloadAttr(ModuleOp module) {
@@ -901,12 +1016,19 @@ struct CppManifestSource {
   std::string module;
   std::string shard;
   std::string kind;
+  bool probeOnly = false;
   uint64_t bytes = 0;
   uint64_t lines = 0;
   uint64_t complexityScore = 0;
   double predictedCompileCost = 0.0;
   std::string sourceHash;
 };
+
+static bool isProbeOnlyFunc(func::FuncOp f) {
+  if (auto attr = f->getAttrOfType<BoolAttr>("pyc.probe_only"))
+    return attr.getValue();
+  return false;
+}
 
 static constexpr double kHardMaxSourcePredictedCompileCost = 15000.0;
 static constexpr double kHardMaxModulePredictedCompileCost = 40000.0;
@@ -919,6 +1041,8 @@ static LogicalResult enforceCppCompileBudgets(ModuleOp module, llvm::ArrayRef<Cp
   llvm::StringMap<double> moduleCosts;
 
   for (const auto &src : sources) {
+    if (src.probeOnly)
+      continue;
     totalCost += src.predictedCompileCost;
     if (src.predictedCompileCost > topSourceCost) {
       topSourceCost = src.predictedCompileCost;
@@ -1609,6 +1733,7 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
     obj["module"] = s.module;
     obj["shard"] = s.shard;
     obj["kind"] = s.kind;
+    obj["probe_only"] = s.probeOnly;
     obj["bytes"] = static_cast<int64_t>(s.bytes);
     obj["lines"] = static_cast<int64_t>(s.lines);
     obj["complexity_score"] = static_cast<int64_t>(s.complexityScore);
@@ -1616,7 +1741,7 @@ static LogicalResult writeCppCompileManifest(llvm::StringRef path,
     obj["source_hash"] = s.sourceHash;
     srcJson.push_back(std::move(obj));
     hashParts.push_back(
-        s.path + "|" + s.module + "|" + s.shard + "|" + s.kind +
+        s.path + "|" + s.module + "|" + s.shard + "|" + s.kind + "|" + (s.probeOnly ? "1" : "0") +
         "|" + std::to_string(s.bytes) + "|" + std::to_string(s.lines) +
         "|" + std::to_string(s.complexityScore) + "|" + s.sourceHash);
   }
@@ -1962,6 +2087,7 @@ int main(int argc, char **argv) {
   pm.addPass(createCSEPass());
   pm.addPass(createSCCPPass());
   pm.addPass(createRemoveDeadValuesPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
 
   pm.addNestedPass<func::FuncOp>(pyc::createLowerSCFToPYCStaticPass());
@@ -1978,6 +2104,7 @@ int main(int argc, char **argv) {
   pm.addPass(createCanonicalizerPass(canonicalizeCfg));
   pm.addPass(createCSEPass());
   pm.addPass(createRemoveDeadValuesPass());
+  pm.addNestedPass<func::FuncOp>(pyc::createEliminateDeadInstancesPass());
   pm.addPass(createSymbolDCEPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckFlatTypesPass());
   pm.addNestedPass<func::FuncOp>(pyc::createCheckNoDynamicPass());
@@ -2208,6 +2335,7 @@ int main(int argc, char **argv) {
         cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
         cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
       }
+      cppEmitOpts.probePlanPath = probePlanPath;
 
       // Collect direct dependencies per module for header includes.
       llvm::StringMap<llvm::SmallVector<std::string>> deps;
@@ -2260,6 +2388,7 @@ int main(int argc, char **argv) {
         if (f.isDeclaration())
           continue;
         std::string moduleName = f.getSymName().str();
+        const bool probeOnlyModule = isProbeOnlyFunc(f);
         std::string headerName = moduleName + ".hpp";
         llvm::SmallString<256> headerPath(outDir);
         llvm::sys::path::append(headerPath, headerName);
@@ -2317,6 +2446,7 @@ int main(int argc, char **argv) {
             info.module = moduleName;
             info.shard = shard.str();
             info.kind = kind.str();
+            info.probeOnly = probeOnlyModule;
             auto srcOrErr = llvm::MemoryBuffer::getFile(srcPath);
             if (!srcOrErr) {
               llvm::errs() << "error: cannot read generated source " << srcPath << " for manifest metadata\n";
@@ -2554,6 +2684,7 @@ int main(int argc, char **argv) {
       cppEmitOpts.evalTopoChunkNodes = cppShardMaxAstNodes;
       cppEmitOpts.combChunkNodes = cppShardMaxAstNodes;
     }
+    cppEmitOpts.probePlanPath = probePlanPath;
     if (failed(pyc::emitCpp(*module, os, cppEmitOpts)))
       return 1;
     if (failed(writeSingleOutputStats()))
