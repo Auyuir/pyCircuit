@@ -50,6 +50,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -73,6 +74,27 @@ static void addRemoveDeadValuesPassIfSupported(PassManager &pm) {
 #else
   pm.addPass(createRemoveDeadValuesPass());
 #endif
+}
+
+template <typename T, typename = void>
+struct GreedyRewriteConfigHasSetters : std::false_type {};
+
+template <typename T>
+struct GreedyRewriteConfigHasSetters<
+    T, std::void_t<decltype(std::declval<T &>().setMaxIterations(int64_t{})),
+                   decltype(std::declval<T &>().setMaxNumRewrites(int64_t{}))>>
+    : std::true_type {};
+
+template <typename T>
+static void configureGreedyRewriteBudget(T &cfg, int64_t maxIterations,
+                                         int64_t maxNumRewrites) {
+  if constexpr (GreedyRewriteConfigHasSetters<T>::value) {
+    cfg.setMaxIterations(maxIterations);
+    cfg.setMaxNumRewrites(maxNumRewrites);
+  } else {
+    cfg.maxIterations = maxIterations;
+    cfg.maxNumRewrites = maxNumRewrites;
+  }
 }
 
 static llvm::cl::opt<std::string> inputFilename(llvm::cl::Positional, llvm::cl::desc("<input .pyc>"),
@@ -2168,8 +2190,9 @@ int main(int argc, char **argv) {
 
   GreedyRewriteConfig canonicalizeCfg;
   if (effectiveCanonicalizeBudget > 0) {
-    canonicalizeCfg.setMaxIterations(static_cast<int64_t>(effectiveCanonicalizeBudget));
-    canonicalizeCfg.setMaxNumRewrites(static_cast<int64_t>(effectiveCanonicalizeBudget) * 4096);
+    configureGreedyRewriteBudget(
+        canonicalizeCfg, static_cast<int64_t>(effectiveCanonicalizeBudget),
+        static_cast<int64_t>(effectiveCanonicalizeBudget) * 4096);
   }
 
   // Cleanup + optimization pipeline tuned for netlist-style emission.
