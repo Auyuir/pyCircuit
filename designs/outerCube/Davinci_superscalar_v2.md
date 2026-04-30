@@ -66,9 +66,38 @@ The v2 ISA is a strict superset of v1: every v1 opcode encodes identically and b
 
 ### 2.1 Scalar ISA
 
-**Unchanged from v1 §2.1.** All branches, jumps, ALU, MUL/DIV, LD/ST, and FENCE instructions are identical. v1 software runs on v2 unmodified.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §2.1。)**
 
-A new optional 1-bit `H` (hint) field in the conditional-branch funct3 encoding lets the compiler suggest static taken/not-taken when the dynamic predictor has no entry. Predictor still has final say once it has trained — H is consulted only on a TAGE/BTB miss.
+A 64-bit RISC instruction set with ARM / RISC-V style operations.
+
+| Category | Instructions | Operands | Latency (cycles) |
+|----------|-------------|----------|-------------------|
+| Integer ALU | ADD, SUB, AND, OR, XOR, SLL, SRL, SRA, SLT, MOV | 2 src GPR, 1 dst GPR | 1 |
+| Immediate ALU | ADDI, ANDI, ORI, XORI, SLLI, SRLI, SRAI, LUI | 1 src GPR + imm, 1 dst GPR | 1 |
+| Multiply | MUL, MULH, MULHU | 2 src GPR, 1 dst GPR | 4 (pipelined) |
+| Divide | DIV, DIVU, REM, REMU | 2 src GPR, 1 dst GPR | 12–20 (non-pipelined) |
+| Compare & branch | BEQ, BNE, BLT, BGE, BLTU, BGEU | 2 src GPR + offset | 1 (resolve) |
+| Jump | JAL, JALR | 1 src GPR + offset, 1 dst GPR | 1 |
+| Load | LB, LH, LW, LD, LBU, LHU, LWU | 1 src GPR + offset, 1 dst GPR | 4 (L1 hit) |
+| Store | SB, SH, SW, SD | 2 src GPR + offset | 4 (L1 hit) |
+| System | FENCE, NOP, HALT | — | varies |
+
+**Architectural registers:** X0 (hardwired zero) through X31, plus a program counter (PC). Condition flags are not used; branches compare register values directly (RISC-V style).
+
+**Encoding (32-bit):**
+
+```
+  31       25 24  20 19  15 14  12 11   7 6     0
+ ┌──────────┬──────┬──────┬──────┬──────┬────────┐
+ │  funct7  │  rs2 │  rs1 │funct3│  rd  │ opcode │  R-type
+ └──────────┴──────┴──────┴──────┴──────┴────────┘
+
+ ┌─────────────────┬──────┬──────┬──────┬────────┐
+ │    imm[11:0]    │  rs1 │funct3│  rd  │ opcode │  I-type
+ └─────────────────┴──────┴──────┴──────┴────────┘
+```
+
+**v2 增量 (§5.2.4):** A new optional 1-bit `H` (hint) field in the conditional-branch funct3 encoding lets the compiler suggest static taken/not-taken when the dynamic predictor has no entry. Predictor still has final say once it has trained — H is consulted only on a TAGE/BTB miss. v1 software runs on v2 unmodified — the `H` bit defaults to 0 (no hint) when assembled by a v1-targeted compiler.
 
 ### 2.2 Vector ISA — VEC-4K-v2
 
@@ -112,13 +141,21 @@ Metadata is written **only** by the producing instruction (implicit at retire) o
 
 | Operand | Role | Tile-RAT entry | Storage |
 |---------|------|----------------|---------|
-| **A** | Value tile (primary, mandatory) | source | TRegFile read port → `SA` staging |
-| **B** | Value tile (secondary, optional) | source | TRegFile read port → `SB` staging |
-| **C** | **Per-element bitmask** (1 b/element) — selects which lanes participate | source (when `has_mask = 1`) | TRegFile read port → `SC` staging |
+| **A** | Value tile (primary, mandatory) | source | TRegFile read port R0 → `SA` staging |
+| **B** | Value tile (secondary, optional) | source | TRegFile read port R4 → `SB` staging |
+| **C** | **Dual role:** `c_role = MASK` → per-element bitmask (1 b/element); `c_role = VALUE` → **third value tile** for native 3-source FMA family (§2.2.6a) | source (when `has_mask = 1` **or** `c_role = VALUE`) | TRegFile read port R1 (v2.1: 3rd VEC-side binding) → `SC` staging |
 | **D0** | Result tile (primary) | destination | Write port `W0` |
 | **D1** | Result tile (secondary, optional) | destination | Write port `W4` |
 
-The 32-bit instruction word reserves a `has_mask` bit (1 if `C` is fetched), a `retire_mask[1:0]` field (which of `D0`, `D1` are written), and per-operand `is_transpose_{A,B,C}` bits forwarded to the TRegFile read ports (§9.2). Tile register fields stay 5 bits (T0–T31).
+The 32-bit instruction word reserves:
+- a `c_role` bit (0 = `MASK`, 1 = `VALUE`),
+- a `has_mask` bit (1 if `C` is fetched **and** `c_role = MASK`),
+- a `retire_mask[1:0]` field (which of `D0`, `D1` are written), and
+- per-operand `is_transpose_{A,B,C}` bits forwarded to the TRegFile read ports (§9.2).
+
+Tile register fields stay 5 bits (T0–T31). When `c_role = VALUE` and `N_val = 3` (e.g. `VFMA`, `VFNMA`, `VLERP`), `C` is fetched as a full 4 KB value tile through the dedicated VEC read port R1 — see §2.2.6a and [`vector4k_v2.md`](vector4k_v2.md) §3.1, §7.6 for the rationale and 3-port binding.
+
+> **Why a third VEC-side TRegFile read port?** TRegFile-4K has 8 physical read ports. v1 and v2.0 used only 2 (R0/R4) for VEC, since operand `C` was strictly a small mask. v2.1 binds **R1 = Port C** so that all three value tiles of a 3-source `VFMA` can be fetched **in parallel within one 8 cy epoch** — same cadence as a binary op. The alternative (sequential 2-epoch fetch on R0/R4) would halve `VFMA` throughput. Bandwidth cost: 0 SRAM, 0 bank-conflict pressure (the diagonal skew already supports 8 conflict-free read ports per [`tregfile4k.md`](tregfile4k.md) §4); only a binding allocation. R1 is idle and clock-gated when no `c_role = VALUE` op is in flight.
 
 #### 2.2.3 Encoding (32-bit)
 
@@ -131,15 +168,17 @@ The 32-bit instruction word reserves a `has_mask` bit (1 if `C` is fetched), a `
  │ + xpB  │      │      │      │       │        │
  │ + xpC  │      │      │      │       │        │
  │ +mask  │      │      │      │       │        │
+ │ +crole │      │      │      │       │        │  ← v2.1: c_role bit (MASK/VALUE)
  │ +rmask │      │      │      │       │        │
  └────────┴──────┴──────┴──────┴───────┴────────┘
    funct6 packs 6 bits split between op-extension (3 b),
    has_mask (1 b), is_xpose_A (1 b), is_xpose_B (1 b);
-   is_xpose_C and retire_mask travel in the immediate slot
-   of S-/T-types or in a fixed funct7 bit pattern.
+   is_xpose_C, c_role, and retire_mask travel in the
+   immediate slot of S-/T-types or in a fixed funct7
+   bit pattern.
 ```
 
-**Backward compatibility:** v1 vector instructions decode as `has_mask = 0`, `retire_mask = 2'b01`, `is_xpose_{A,B,C} = 0` — i.e. unmasked, single-result, no-transpose — and produce bit-exact v1 results.
+**Backward compatibility:** v1 vector instructions decode as `has_mask = 0`, `c_role = MASK`, `retire_mask = 2'b01`, `is_xpose_{A,B,C} = 0` — i.e. unmasked, single-result, no-transpose, no-3rd-tile — and produce bit-exact v1 results. `c_role = VALUE` is only generated by a v2.1-aware compiler emitting `VFMA` / `VFNMA` / `VLERP`; v1 binaries cannot express it.
 
 #### 2.2.4 Masked / predicated variants
 
@@ -164,6 +203,52 @@ Two orthogonal transpose mechanisms, both reusing the chunk-grid transpose algor
 The two combine: a tile may be fetched in row-mode and then read in col-mode beat-by-beat from staging, or fetched pre-transposed (col-mode) and re-read in row-mode. Microcode picks the combination per instruction.
 
 **TRegFile-side rule R2** ([`tregfile4k.md`](tregfile4k.md) §6): the two physical read ports active in any 8-cycle epoch must share the same `is_transpose`. For a 2-value-operand instruction with `is_xpose_A ≠ is_xpose_B`, microcode splits the fetch into two epochs (16 cy instead of 8 cy) — this is the only scheduling cost of the new flag (§8.3.6).
+
+#### 2.2.6a Native 3-source ternary FMA family (`VFMA`, `VFNMA`, `VLERP`) — v2.1 增量
+
+A new family of vector instructions that consume **three independent value tiles** and produce one (or two) result tiles, enabled by the operand-`C` dual-role mechanism (§2.2.2) and the 3rd VEC-side TRegFile read port (R1, [`vector4k_v2.md`](vector4k_v2.md) §3.1, §7.6). v0.16 of [`vector4k_v2.md`](vector4k_v2.md) only supported ternary FMA via the **accumulator feedback path** (`VFMA_ACC D = A·B + Acc`), which is suitable for GEMM-epilogue / FMA-accumulate kernels but **fails** for the canonical FMA pattern `D = A·B + C` where the third operand is **not** the previous accumulator.
+
+| Mnemonic | Operands | Semantics | Encoding | Cycle budget (typical, uniform `is_transpose`) |
+|----------|----------|-----------|----------|-------------------------------------------------|
+| **VFMA** | `Td0, Ta, Tb, Tc` | `Td0 = Ta · Tb + Tc` (single-rounding IEEE-754 FMA, all formats) | R-type, `c_role = VALUE`, `has_mask = 0` | **8 cy fetch (3-port parallel) + 8 compute beats + 1 cy fall-through ≈ 10–12 cy end-to-end** — same as `VADD`/`VMUL` |
+| **VFNMA** | `Td0, Ta, Tb, Tc` | `Td0 = -(Ta · Tb) + Tc` | R-type, `c_role = VALUE`, `funct6.fnma = 1` | same as `VFMA` |
+| **VLERP** | `Td0 [, Td1], Ta, Tb, Tc` | `Td0 = Ta · (1 − Tc) + Tb · Tc` (linear interpolation; optional `Td1 = Tb − Ta` retired in same op) | R-type, `c_role = VALUE`, `funct6.lerp = 1` | 2 fused beats per strip (8 strip × 2 beat = 16 compute beats), `~18 cy` end-to-end |
+
+**Why this family is needed.** From [`FMA指令场景说明.md`](FMA指令场景说明.md):
+
+| Real-world kernel | FMA form | Notes |
+|-------------------|----------|-------|
+| **LayerNorm / RMSNorm final affine** | `y = γ·x̂ + β` | The dominant FMA in transformer normalisation. `γ`, `x̂`, `β` are three independent tile registers — none is the accumulator. Without `VFMA`, every LayerNorm pays 2× cost (`VMUL` + `VADD`). |
+| **Welford incremental update — mean** | `μ_new = δ·inv_n + μ_old` | Streaming variance estimator at the heart of LayerNorm reductions. |
+| **Welford incremental update — M2** | `M2_new = δ·δ_2 + M2_old` | Single-rounding FMA preserves precision against catastrophic cancellation on small variance terms (matters for FP16 / BF16 / FP8). |
+| **Welford state merge** | `μ = δ·factor + μ_A`; `M2 = M2_A + δ·(δ·factor_m2) + M2_B` | Distributed-norm cross-thread merges. |
+| **Activation polynomials** | `gelu`, `swiglu` polynomial / Padé approximations | Multiple FMAs over independent tile inputs. |
+| **Trigonometric polynomials** | `sin(x) ≈ x·(c₁ + x²·(c₃ + x²·c₅))` | Horner-form FMAs. |
+
+**Justification (decisive advantages of FMA over emulated `MUL` + `ADD`):**
+
+1. **Throughput doubling** — one fused instruction instead of two halves the FMA-bound pipeline depth and the issue/RS occupancy.
+2. **Precision preservation** — IEEE-754 FMA performs a *single* rounding after the infinite-precision `A·B` intermediate, eliminating the second-rounding error of `(A·B) + C`. This matters for FP16 / BF16 / FP8 normalisation kernels that re-feed the result into subsequent reductions.
+
+**Hardware delta (vs. v0.16).** The stage (B) per-lane FMA core, microcode beat machinery, and 8-port TRegFile already supported `A·B + Z`. The only structural changes are:
+
+| Block | Δ |
+|-------|---|
+| `MUX_Z` per-lane input MUX (already 6:1) — one source retargeted to `SC` value-mode read | ~0 (same gate count) |
+| `SC` staging — add 512 B/cy value-mode read path alongside the existing 1-bit-mask read path (sub-bank tree reused from [`vector4k_v2.md`](vector4k_v2.md) §4.2.1) | **~5 K gate** |
+| TRegFile read port R1 binding to VEC | **0** (allocation only — TRegFile-4K already has 8R) |
+| Issue-time `c_role` bit through Tile RAT / RS / dispatch | **~1 K gate** (control-path widening) |
+| **Total v2.1 hardware add** | **~6 K gate (~0.2 % of VEC-4K-v2 area)** |
+
+**Pipeline timing** (Davinci-v2.1 vector pipeline, [`vector4k_v2.md`](vector4k_v2.md) §6.2):
+
+| Op | `N_val` | `c_role` | `is_transpose` mix | Fetch | Compute | End-to-end | Throughput |
+|----|--------:|----------|---------------------|------:|--------:|-----------:|------------|
+| **VFMA** (typical) | 3 | VALUE | uniform | **8 cy** | 8 beats | **~10–12 cy** | **1 tile / 8 cy** |
+| VFMA (one xp odd-out) | 3 | VALUE | one-mismatched | 16 cy | 8 beats | ~18 cy | 1 tile / 16 cy |
+| VFMA (all xp different — degenerate) | 3 | VALUE | all distinct | 24 cy | 8 beats | ~26 cy | 1 tile / 24 cy |
+
+**Backward compatibility.** A v1 / v2.0 binary emits `c_role = MASK` exclusively; the new instructions are decoded only when the v2.1-aware compiler sets `c_role = VALUE`. Old binaries see no behaviour change and the R1 read port stays idle and clock-gated.
 
 #### 2.2.6 New PTO instructions
 
@@ -193,12 +278,13 @@ Use cases: reshaping a tile produced by `CUBE.DRAIN` (which writes payload but n
 
 #### 2.2.8 Updated vector instruction list (highlights)
 
-The **95-instruction v1 vector ISA** carries forward, with two changes:
+The **95-instruction v1 vector ISA** carries forward, with three changes:
 
 1. Each instruction gets a "masked" variant (no new mnemonic — encoded by `has_mask`).
 2. `TSORT32` and `TMRGSORT` from v1 are subsumed by the new `TMRGSORT` (§2.2.6). v1's `TSORT32` mnemonic remains as an alias for `TMRGSORT N=32`.
+3. **v2.1 增量:** A new family of native 3-source ternary FMA instructions (`VFMA`, `VFNMA`, `VLERP`) is added under Category O (§2.2.6a), motivated by LayerNorm / Welford / activation / trig kernels (see [`FMA指令场景说明.md`](FMA指令场景说明.md)).
 
-Categories A–M of v1 §2.2.3 are unchanged in semantics. New Category N is added:
+Categories A–M of v1 §2.2.3 are unchanged in semantics. Two new categories are added:
 
 **Category N — Numerical / Reconfigurable Compute (new in v2)**
 
@@ -209,20 +295,172 @@ Categories A–M of v1 §2.2.3 are unchanged in semantics. New Category N is add
 | TMRGSORT | Td0, Td1, Tsrc, log2N [, Tmask] | Bitonic sort, value+index dual retire | 36 – 2 912 beats |
 | TSETMETA | Td, shape.x, shape.y, format | Rewrite tile metadata in-place | 0 (rename-only) |
 
+**Category O — Native 3-source Ternary FMA family (new in v2.1; §2.2.6a)**
+
+| Mnemonic | Operands | Semantics | Latency (typical) |
+|----------|----------|-----------|--------------------|
+| **VFMA** | `Td0, Ta, Tb, Tc` | `Td0 = Ta · Tb + Tc` (single-rounding IEEE-754 FMA) | **~10–12 cy** end-to-end (8 cy fetch + 8 compute beats); throughput **1 tile / 8 cy** |
+| **VFNMA** | `Td0, Ta, Tb, Tc` | `Td0 = -(Ta · Tb) + Tc` | same as `VFMA` |
+| **VLERP** | `Td0 [, Td1], Ta, Tb, Tc` | `Td0 = Ta·(1−Tc) + Tb·Tc`; optional `Td1 = Tb − Ta` retired in same instruction | ~18 cy end-to-end (8 cy fetch + 16 compute beats) |
+
+All three issue with `c_role = VALUE`. Mixed `is_transpose_{A,B,C}` adds 8 cy per odd-out (one mismatch → 16 cy fetch; all three different → 24 cy fetch — degenerate). Common kernels (LayerNorm `γ·x̂ + β`, Welford updates) all use uniform `is_transpose` and hit the **8 cy** path.
+
 ### 2.3 Cube ISA
 
-**Unchanged from v1.** The outerCube MXU and its `CUBE.{CFG,OPA,DRAIN,ZERO,WAIT}` instructions retain their v1 semantics, encoding, and pipeline. The Tile RAT renames cube operands as before.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §2.3。)**
 
-### 2.4 MTE ISA
+Tile-level instructions that drive the outerCube MXU. Each `CUBE.OPA` consumes tile registers and executes all K-loop OPA steps internally.
 
-**Unchanged in opcode encoding from v1**, but with two implementation changes that are transparent to software:
+| Instruction | Operands | Function |
+|-------------|----------|----------|
+| CUBE.CFG | mode, fmt [, Mactive] | Set operating mode (A/B) and data format |
+| CUBE.OPA | zd, Ta, Tb, Rn | Outer product accumulate: iterate over Nb B-tiles |
+| CUBE.DRAIN | zd, Tc | Drain accumulator buffer to tile register(s) |
+| CUBE.ZERO | zd | Zero accumulator buffer (1 cycle) |
+| CUBE.WAIT | zd | Stall until pending drain completes |
 
-1. **`TILE.TRANSPOSE` is now a software-optional accelerator.** With per-port `is_transpose` on the TRegFile read (§9.2) and per-beat `tilelet_xpose` in the vector unit (§8.3), most "pre-transpose then consume" patterns become single-instruction with `is_xpose_*` set on the consuming op. `TILE.TRANSPOSE` is retained for cases that need a *materialized* transposed tile to be reused many times across instructions that themselves don't carry the bit, but the v2 MTE transpose buffer (§8.5) shrinks to a small 512 B staging slice (only used during element-level fixup for non-aligned `W` regimes — see [`tregfile4k.md`](tregfile4k.md) §7.5).
-2. **All bulk tile stores (`TILE.ST`, `TILE.SCATTER`) acquire a branch tag at dispatch** and are gated through the **Speculative Tile-Store Queue** (STQ) until their tag becomes non-speculative (§11.5). This is invisible at the ISA level but adds 0–6 cycles of latency to a tile store on the speculative path.
+Supported formats: FP16, BF16, FP8 (E4M3/E5M2), MXFP4, HiFP4. All accumulate into FP32.
+
+Full cube ISA specification: see [`outerCube.md`](outerCube.md) §6. The Tile RAT renames cube operands exactly as in v1; the outerCube MXU itself is unmodified between v1 and v2.
+
+### 2.4 MTE ISA (Memory Tile Engine)
+
+> **(v1 → v2: ISA 编码与语义 100% 兼容。以下 §2.4.1 / §2.4.2 / §2.4.3 完整复制自 v1 §2.4。v2 实现层增量列在本节末。)**
+
+The MTE bridges three domains: **memory ↔ TRegFile-4K** (bulk tile transfers) and **scalar GPR ↔ TRegFile-4K** (single-element access). All MTE instructions flow through both the Scalar RAT and Tile RAT at rename.
+
+#### 2.4.1 Bulk Tile Transfer Instructions
+
+| Instruction | Operands | Function |
+|-------------|----------|----------|
+| TILE.LD | Td, [Rbase] | Contiguous load: 4 KB from address Rbase → tile Td |
+| TILE.LD | Td, [Rbase], Rs | Strided load: rows at stride Rs → tile Td |
+| TILE.ST | [Rbase], Ts | Contiguous store: tile Ts → 4 KB at address Rbase |
+| TILE.ST | [Rbase], Ts, Rs | Strided store: tile Ts → rows at stride Rs |
+| TILE.GATHER | Td, [Rbase], Tidx | Gather: indexed load using index tile (element offsets in Tidx) |
+| TILE.SCATTER | [Rbase], Ts, Tidx | Scatter: indexed store using index tile (element offsets in Tidx) |
+| TILE.ZERO | Td | Zero tile register Td |
+| TILE.COPY | Td, Ts | Copy tile Ts → Td (allocates new physical tile, copies data) |
+
+#### 2.4.2 Tile Manipulation Instructions
+
+| Instruction | Operands | Function |
+|-------------|----------|----------|
+| TILE.MOVE | Td, Ts | Move tile Ts → Td (rename-only, zero-copy; see move elimination below) |
+| TILE.TRANSPOSE | Td, Ts, fmt | Transpose tile Ts with element format fmt → tile Td |
+
+**TILE.MOVE Td, Ts** — Logically copies tile Ts to Td, but is implemented as **move elimination** at the rename stage: the Tile RAT entry for Td is simply updated to point to the same physical tile as Ts. No data is copied, no physical tile is allocated from the free list, and no execute stage is needed. The instruction completes in **zero cycles** (handled entirely at D2 rename).
+
+```
+  Rename (D2) for TILE.MOVE Td, Ts:
+    1. Read Tile RAT[Ts] → PT_src (current physical tile for Ts)
+    2. Read Tile RAT[Td] → PT_old (old physical tile for Td, becomes orphan)
+    3. Write Tile RAT[Td] ← PT_src  (Td now aliases same physical tile as Ts)
+    4. Increment refcount(PT_src)     (one more architectural name maps to it)
+    5. Mark PT_old as orphan; if refcount(PT_old)==0 → free to tile free list
+    6. No RS entry allocated; no execute stage; instruction retires at D2
+    7. Ready bit for Td inherits ready state of PT_src
+```
+
+After TILE.MOVE, Td and Ts share the same physical tile. This is safe under rename: the next instruction that writes to either Td or Ts will allocate a fresh physical tile at that point, naturally "splitting" the alias. TILE.MOVE is critical for avoiding unnecessary 4 KB copies in tile register spill/fill sequences and data routing between pipeline stages.
+
+**TILE.TRANSPOSE Td, Ts, fmt** — Reads tile Ts, transposes the 2D element matrix according to the element format `fmt`, and writes the result to tile Td. The transpose treats the 4 KB tile as a 2D matrix with dimensions determined by the element width:
+
+| fmt (funct3) | Element width | Tile layout (rows × cols) | Transpose block |
+|-------------|--------------|---------------------------|-----------------|
+| 000 (FP64) | 8 B | 64 × 8 | 8 × 8 (8 blocks of 8 rows) |
+| 001 (FP32) | 4 B | 64 × 16 | 16 × 16 (4 blocks of 16 rows) |
+| 010 (FP16) | 2 B | 64 × 32 | 32 × 32 (2 blocks of 32 rows) |
+| 011 (BF16) | 2 B | 64 × 32 | 32 × 32 (2 blocks of 32 rows) |
+| 100 (FP8) | 1 B | 64 × 64 | 64 × 64 (1 block, full tile) |
+| 101 (INT32) | 4 B | 64 × 16 | 16 × 16 (4 blocks of 16 rows) |
+| 110 (INT16) | 2 B | 64 × 32 | 32 × 32 (2 blocks of 32 rows) |
+| 111 (INT8) | 1 B | 64 × 64 | 64 × 64 (1 block, full tile) |
+
+The transpose operates on **square sub-blocks** whose dimension equals the number of elements per 512-bit row. For FP8/INT8 the entire tile is one 64×64 block and transposes in-place. For FP16/BF16/INT16, the 64 rows are split into two 32-row halves, each transposed as a 32×32 block. In v1, the MTE unit contained a dedicated **transpose buffer** (4 KB SRAM) that accumulated rows during the read epoch and emitted transposed rows during the write epoch. In v2 this buffer shrinks to 512 B (see §8.5.1).
+
+```
+  TILE.TRANSPOSE encoding (32-bit):
+  ┌──────────┬──────┬──────┬──────┬──────┬────────┐
+  │  funct7  │ 00000│  Ts  │ fmt  │  Td  │ opcode │
+  │ 0100010  │ (5b) │ (5b) │(3b)  │ (5b) │ 10xxxxx│
+  └──────────┴──────┴──────┴──────┴──────┴────────┘
+```
+
+#### 2.4.3 Scalar ↔ Tile Element Access Instructions
+
+| Instruction | Operands | Function |
+|-------------|----------|----------|
+| TILE.GET | Rd, Ts, Ridx | Read single element: element at index Ridx in tile Ts → scalar GPR Rd |
+| TILE.PUT | Td, Rs, Ridx | Write single element: scalar GPR Rs → element at index Ridx in tile Td |
+
+**TILE.GET Rd, Ts, Ridx** — Reads one element from tile Ts at the position specified by scalar register Ridx. The element is zero-extended to 64 bits and written to scalar destination GPR Rd. The element data type (FP16, FP32, FP64, INT8, etc.) is encoded in the instruction's `funct3` field, which determines element width and the extraction offset within the 512-bit row. Ridx encodes a linear element index: `row = Ridx / elements_per_row`, `col = Ridx % elements_per_row`.
+
+**TILE.PUT Td, Rs, Ridx** — Writes the lower bits of scalar GPR Rs into tile Td at the element position specified by Ridx. This is a **read-modify-write** operation on the tile: the rename stage treats Td as both source (old mapping, read) and destination (new physical tile, write). The MTE unit copies the source physical tile to the destination physical tile, then overwrites the single element. The element data type is encoded in `funct3`.
+
+```
+  TILE.GET encoding (32-bit):
+  ┌──────────┬──────┬──────┬──────┬──────┬────────┐
+  │  funct7  │ Ridx │  Ts  │funct3│  Rd  │ opcode │
+  │ 0100000  │ (5b) │ (5b) │ type │ (5b) │ 10xxxxx│
+  └──────────┴──────┴──────┴──────┴──────┴────────┘
+       Ts: architectural tile register (T0–T31)
+       Ridx: scalar GPR holding element index
+       Rd: scalar GPR destination
+       funct3: element type (000=FP64, 001=FP32, 010=FP16, 011=BF16, 100=FP8, 101=INT32, 110=INT16, 111=INT8)
+
+  TILE.PUT encoding (32-bit):
+  ┌──────────┬──────┬──────┬──────┬──────┬────────┐
+  │  funct7  │  Rs  │ Ridx │funct3│  Td  │ opcode │
+  │ 0100001  │ (5b) │ (5b) │ type │ (5b) │ 10xxxxx│
+  └──────────┴──────┴──────┴──────┴──────┴────────┘
+       Td: architectural tile register (T0–T31) — read-modify-write
+       Rs: scalar GPR holding element value
+       Ridx: scalar GPR holding element index
+       funct3: element type
+```
+
+Every MTE instruction flows through both the **Scalar RAT** (for address/data operands) and the **Tile RAT** (for tile operands) at the D2 rename stage:
+
+| Instruction | Scalar RAT | Tile RAT source(s) | Tile RAT destination | Result bus |
+|-------------|-----------|---------------------|----------------------|------------|
+| TILE.LD Td, [Rbase] | Rbase → P-reg lookup | — | Td → allocate new PT | TCB |
+| TILE.LD Td, [Rbase], Rs | Rbase, Rs → P-reg lookups | — | Td → allocate new PT | TCB |
+| TILE.ST [Rbase], Ts | Rbase → P-reg lookup | Ts → PT lookup | — | — |
+| TILE.ST [Rbase], Ts, Rs | Rbase, Rs → P-reg lookups | Ts → PT lookup | — | — |
+| TILE.GATHER Td, [Rbase], Tidx | Rbase → P-reg lookup | Tidx → PT lookup | Td → allocate new PT | TCB |
+| TILE.SCATTER [Rbase], Ts, Tidx | Rbase → P-reg lookup | Ts, Tidx → PT lookups | — | — |
+| TILE.ZERO Td | — | — | Td → allocate new PT | TCB |
+| TILE.COPY Td, Ts | — | Ts → PT lookup | Td → allocate new PT | TCB |
+| **TILE.MOVE Td, Ts** | — | Ts → PT lookup | **Td → alias PT(Ts)** (no alloc) | **— (rename-only)** |
+| **TILE.TRANSPOSE Td, Ts, fmt** | — | Ts → PT lookup | Td → allocate new PT | TCB |
+| **TILE.GET Rd, Ts, Ridx** | Ridx → P-reg lookup; **Rd → allocate new P-reg** | Ts → PT lookup | — | **CDB** (scalar) |
+| **TILE.PUT Td, Rs, Ridx** | Rs, Ridx → P-reg lookups | **Td → PT lookup (old)** | **Td → allocate new PT** | TCB |
+
+Key observations:
+- **TILE.MOVE** is handled entirely at D2 rename (**move elimination**): Tile RAT[Td] is pointed to the same physical tile as Ts. No free-list allocation, no RS entry, no execute stage, no result bus. Zero-cycle latency.
+- **TILE.TRANSPOSE** allocates a new physical tile and requires a full read-then-transpose-then-write pass through the MTE's transpose buffer.
+- **TILE.GET** produces a **scalar GPR result** (broadcast on CDB), while consuming a tile source. It requires both a Tile RAT source lookup and a Scalar RAT destination allocation.
+- **TILE.PUT** is a **read-modify-write** on the tile: the rename stage looks up the old physical tile mapping as a source AND allocates a new physical tile as a destination. The MTE unit copies the old tile contents to the new tile, then overwrites the single element.
+
+After rename, MTE RS entries carry physical scalar register tags (from Scalar RAT) and physical tile tags (from Tile RAT). The MTE unit maintains a large outstanding request buffer to maximize memory-level parallelism.
+
+#### 2.4.4 v2 实现层增量(对软件不可见)
+
+1. **`TILE.TRANSPOSE` becomes a software-optional accelerator.** With per-port `is_transpose` on the TRegFile read (§9.2) and per-beat `tilelet_xpose` in the vector unit (§8.3), most "pre-transpose then consume" patterns become single-instruction with `is_xpose_*` set on the consuming op. `TILE.TRANSPOSE` is retained for cases that need a *materialized* transposed tile reused many times across instructions that themselves don't carry the bit; its physical staging buffer shrinks from 4 KB → 512 B (§8.5.1).
+2. **All bulk tile stores (`TILE.ST`, `TILE.SCATTER`) acquire a branch tag at dispatch** and are gated through the **Speculative Tile-Store Queue** (STQ, §11.5) until their tag becomes non-speculative. Invisible at the ISA level; adds 0–6 cycles of latency to a tile store on the speculative path.
 
 ### 2.5 Instruction Domain Identification
 
-**Unchanged from v1.** Opcode[6:5] still selects scalar / vector / cube / MTE.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §2.5。)**
+
+The 7-bit opcode field encodes the instruction domain:
+
+| Opcode[6:5] | Domain | Decode path |
+|-------------|--------|-------------|
+| 00, 01 | Scalar | Scalar rename → Scalar RS |
+| 10 | Vector / MTE | Tile RAT rename → Vector RS or MTE RS |
+| 11 | Cube | Tile RAT rename → Cube RS |
 
 ---
 
@@ -326,17 +564,73 @@ Categories A–M of v1 §2.2.3 are unchanged in semantics. New Category N is add
 
 ## 4. Pipeline Overview
 
+> **(v1 → v2: 4.A / 4.B / 4.C 完整复制自 v1 §4.1 / §4.2 / §4.3。流水线深度、阶段定义、各域执行延迟未变更。v2 增量集中在 §4.1 / §4.2 / §4.3。)**
+
 The v2 scalar pipeline is the same **12 stages** as v1 (no retire/commit stage). Branch-tag administration adds zero cycles — tags are allocated at D2 (alongside the existing checkpoint allocation) and propagated forward as one extra metadata field per RS entry.
 
 ```
- F1 → F2 → D1 → D2 → DS → IS → EX1 → EX2 → EX3 → EX4 → WB
- ├── Fetch ──┤├─ Decode/Rename ─┤├DS┤├IS┤├──── Execute ────┤├WB┤
+ F1 → F2 → D1 → D2 → DS → IS → EX1 → EX2 → EX3 → EX4 → WB → (no retire)
+ ├── Fetch ──┤├─ Decode/Rename ─┤├DS┤├IS┤├──── Execute ────────┤├WB┤
                        │
                        └── allocate branch_tag ∈ {0..7} for each in-flight branch
                        └── flash-copy {Scalar RAT, Tile RAT, Tile-Meta RAT,
                                        free-list heads, RAS top, SSB head, STQ head}
                                        into checkpoint[tag]
 ```
+
+### 4.A Pipeline Stages (v1 §4.1, 未变更)
+
+| Stage | Name | Function |
+|-------|------|----------|
+| F1 | Fetch-1 | Send PC to L1-I cache and branch predictor |
+| F2 | Fetch-2 | Receive 4 instructions from I-cache; apply BTB/TAGE prediction |
+| D1 | Decode | Decode 4 instructions; identify domain (scalar/vector/cube/MTE) |
+| D2 | Rename | Read Scalar RAT + Tile RAT (+ Tile-Meta RAT in v2); allocate physical registers/tiles; intra-group bypass; checkpoint all RATs on branch; *(v2)* allocate branch_tag |
+| DS | Dispatch | Allocate reservation station entry; write operand tags/data; *(v2)* allocate SSB/STQ slot for memory-side stores |
+| IS | Issue | Select oldest ready instruction per functional unit; read physical RF |
+| EX1–EXn | Execute | Variable latency: ALU=1cy, MUL=4cy, LD=4cy(L1 hit), VEC=16cy(2 epochs, elementwise), MTE=8–72cy(epoch+mem), DIV=12–20cy |
+| WB | Writeback | Broadcast result on CDB/TCB; write to physical RF / TRegFile-4K; wakeup dependent RS entries; *(v2)* SSB/STQ entries become drain-ready when branch_tag clears |
+
+### 4.B Pipeline Timing — Scalar ALU Instruction (v1 §4.2, 未变更)
+
+```
+  Cycle:  0    1    2    3    4    5    6    7
+  ─────  ────  ────  ────  ────  ────  ────  ────
+  i0:    F1   F2   D1   D2   DS   IS   EX1  WB
+  i1:    F1   F2   D1   D2   DS   IS   EX1  WB
+  i2:    F1   F2   D1   D2   DS   IS   EX1  WB
+  i3:    F1   F2   D1   D2   DS   IS   EX1  WB
+         └──── 4-wide ────────┘
+```
+
+### 4.C Execution Latencies by Domain (v1 §4.3, 未变更)
+
+| Domain | Operation | Stages | Latency (cycles) | Pipelined |
+|--------|-----------|--------|-------------------|-----------|
+| Scalar | ALU (add, logic, shift) | EX1 | **1** | yes |
+| Scalar | MUL | EX1–EX4 | **4** | yes |
+| Scalar | DIV | EX1–EX(12–20) | **12–20** | no |
+| Scalar | Branch resolve | EX1 | **1** | yes |
+| LSU | Load (L1 hit) | EX1–EX4 | **4** | yes |
+| LSU | Load (L2 hit) | EX1–EX(12) | **12** | yes |
+| LSU | Store | EX1–EX4 | **4** (addr+data) | yes |
+| Vector | VADD/VMUL/VFMA (full tile, elementwise) | 2 epochs (16 cy) | **16** (8 read + 8 write, compute hidden) | epoch-pipelined |
+| Vector | Reduce (VROWSUM/VCOLSUM/...) | 1 epoch + reduce | **16** (8 read + reduce + 8 write) | no |
+| Vector (v2) | TINV (128×128 FP32) | multi-epoch | **~33 K beats** (~22 µs @ 1.5 GHz) | no |
+| Vector (v2) | TMRGSORT (1024 FP32) | multi-epoch | **~220 cy** | no |
+| Cube | CUBE.OPA (N steps) | 19 + N | **N + 18** (first tile) | epoch-pipelined |
+| MTE | TILE.LD (contiguous, L2 hit) | mem + 1 write epoch | **72** (64 mem + 8 TRegFile write) | yes (across ports) |
+| MTE | TILE.ST (contiguous, L2) | 1 read epoch + mem | **72** (8 TRegFile read + 64 mem write) | yes (across ports) |
+| MTE | TILE.COPY | 2 epochs | **16** (8 read + 8 write) | epoch-pipelined |
+| MTE | TILE.ZERO | 1 write epoch | **8** (write zeros, no read) | yes |
+| MTE | TILE.GATHER (L2 hit) | mem + 1 write epoch | **72–128** (variable mem + 8 TRegFile write) | partially |
+| MTE | TILE.SCATTER (L2) | 1 read epoch + mem | **72–128** (8 TRegFile read + variable mem) | partially |
+| MTE | TILE.MOVE (rename-only) | — (D2) | **0** (move elimination, no execute) | — |
+| MTE | TILE.TRANSPOSE | 2 epochs | **16** (8 read + 8 write via transpose buffer) | no |
+| MTE | TILE.GET (element → GPR) | 1 read epoch + extract | **9** (8 TRegFile read epoch + 1 extract) | no (port occupied 8 cy) |
+| MTE | TILE.PUT (GPR → element, RMW) | 2 epochs | **16** (8 read + 8 write), **8** with copy elision | no |
+
+---
 
 ### 4.1 Per-stage actions (v2 deltas)
 
@@ -348,9 +642,9 @@ The v2 scalar pipeline is the same **12 stages** as v1 (no retire/commit stage).
 | **EX — Execute** | LSU stores deposit data + address into the SSB slot, but do **not** commit to L1-D. MTE bulk-stores deposit address-list + data into the STQ slot, but do **not** drain to memory. Both wait for `branch_tag → non-speculative` (§11.4, §11.5). |
 | **WB — Writeback** | Unchanged for scalar/tile *register* destinations. Memory-side commits gated on tag-clear from the speculation tracker. |
 
-### 4.2 Pipeline timing — unchanged from v1
+### 4.2 Pipeline timing (v2 增量说明)
 
-Scalar ALU, MUL, LD, branch resolve, and vector instruction timing (epoch-pipelined at 1 tile/8 cy) are all preserved. The only timing change is the variable operand-fetch prologue of VEC-4K-v2 (§8.3.6): `T_fetch ∈ {8 cy, 16 cy}` depending on `is_xpose_*` mix. End-to-end vector-instruction latency is unchanged for uniformly-transposed (or uniformly-non-transposed) operands.
+Scalar ALU, MUL, LD, branch resolve, and elementwise-vector timing (epoch-pipelined at 1 tile/8 cy) are all preserved as in §4.B / §4.C above. The only timing change in v2 is the **variable operand-fetch prologue** of VEC-4K-v2 (§8.3.6): `T_fetch ∈ {8 cy, 16 cy}` depending on `is_xpose_*` mix among the 3 source tiles. End-to-end vector-instruction latency is unchanged for uniformly-transposed (or uniformly-non-transposed) operands.
 
 ### 4.3 Branch misprediction penalty
 
@@ -368,9 +662,76 @@ The SSB / STQ flush runs in parallel with the RAT flash-restore: both are mask-c
 
 ## 5. Front-End: Fetch & Branch Prediction
 
-**Largely unchanged from v1 §5.** Fetch unit, BTB (2048 entries), TAGE (~20 KB), and RAS (16 entries) are identical. Two small additions:
+> **(v1 → v2: 子节 5.A / 5.B / 5.C 完整复制自 v1 §5.1 / §5.2 / §5.3,内容未变更。v2 增量为 §5.1 Branch-tag allocator 与 §5.2 Static hint bit。)**
 
-### 5.1 Branch-tag allocator
+### 5.A Fetch Unit (v1 §5.1, 未变更)
+
+The fetch unit delivers up to **4 aligned instructions per cycle** from the L1 instruction cache.
+
+| Parameter | Value |
+|-----------|-------|
+| Fetch width | **4** instructions / cycle (16 bytes) |
+| Fetch alignment | 16-byte aligned fetch block |
+| Instruction buffer | **16** entries (4-cycle decoupling) |
+| L1-I cache | **64 KB**, 4-way set-associative, 64 B line |
+| L1-I latency | **2** cycles (F1 + F2) |
+| I-TLB | 64 entries, fully associative |
+
+**Fetch pipeline:**
+
+```
+  F1: PC → I-TLB + L1-I tag lookup + BTB lookup + TAGE index
+  F2: L1-I data return (4 instructions) + TAGE prediction + RAS check
+      → push into instruction buffer (up to 16 entries)
+      → if predicted-taken: redirect PC at end of F2
+```
+
+### 5.B Branch Predictor (v1 §5.2, 未变更)
+
+The branch predictor uses a **hybrid scheme** combining three components.
+
+#### 5.B.1 TAGE Predictor (Conditional Branches)
+
+| Parameter | Value |
+|-----------|-------|
+| Base predictor | 4K-entry bimodal (2-bit saturating counters) |
+| Tagged tables | 5 tables: T1(512), T2(512), T3(1K), T4(1K), T5(1K) |
+| History lengths | 4, 8, 16, 32, 64 (geometric series) |
+| Tag width | 8–12 bits per entry |
+| Total storage | ~20 KB |
+| Prediction accuracy | ~95% (typical workloads) |
+
+#### 5.B.2 Branch Target Buffer (BTB)
+
+| Parameter | Value |
+|-----------|-------|
+| Entries | **2048** |
+| Associativity | 4-way set-associative |
+| Tag | partial PC (upper bits) |
+| Target | full 64-bit target address |
+| Hit latency | 1 cycle (available end of F1) |
+
+#### 5.B.3 Return Address Stack (RAS)
+
+| Parameter | Value |
+|-----------|-------|
+| Depth | **16** entries |
+| Push | on JAL/JALR to link register |
+| Pop | on JALR from link register (return pattern) |
+| Speculative management | checkpoint RAS top-of-stack pointer with RAT checkpoints |
+
+### 5.C Fetch Redirect Priorities (v1 §5.3, 未变更)
+
+```
+  Priority (highest to lowest):
+    1. Branch mispredict redirect (from EX1)  — flush + restart
+    2. BTB/TAGE taken-branch redirect (from F2) — next-cycle redirect
+    3. Sequential PC+16 (default)
+```
+
+---
+
+### 5.1 Branch-tag allocator (v2 增量)
 
 A small hardware counter at D2 allocates a 3-bit branch_tag for each newly-decoded branch, drawn from the same 8-slot pool used by the v1 RAT-checkpoint store. Allocation policy is round-robin among free slots; when the pool is empty, the rename stage stalls (same condition as v1's checkpoint-pool exhaustion).
 
@@ -384,7 +745,7 @@ The branch_tag is then attached to:
 
 When the branch resolves correctly, the tag is freed and propagated as a "tag-clear" event to all consumers (RS / SSB / STQ). When it mispredicts, the tag becomes the "flush key" — every entry tagged with this branch (or any *younger* branch tag) is invalidated atomically (§11.4.4).
 
-### 5.2 Static hint bit
+### 5.2 Static hint bit (v2 增量)
 
 The compiler may set the conditional-branch funct3's `H` bit (1 = predict taken on TAGE/BTB miss). The hint is consulted only on a predictor cold-miss; once TAGE has trained on the branch, dynamic prediction wins.
 
@@ -392,9 +753,132 @@ The compiler may set the conditional-branch funct3's `H` bit (1 = predict taken 
 
 ## 6. Decode & Rename
 
-**Largely unchanged from v1 §6.** All four register renaming structures (Scalar RAT, Tile RAT, Scalar free list, Tile free list) operate identically. Three small additions:
+> **(v1 → v2: 子节 6.A / 6.B 完整复制自 v1 §6.1 / §6.2,内容未变更。v2 增量为 §6.1 Tile Metadata RAT、§6.2 Branch-tag stamping、§6.3 Checkpoint extensions。)**
 
-### 6.1 Tile Metadata RAT
+### 6.A Decode Stage (D1) — (v1 §6.1, 未变更)
+
+The decode stage processes **4 instructions per cycle**, identifying each instruction's domain, opcode, source/destination registers, and immediate values.
+
+| Function | Detail |
+|----------|--------|
+| Decode width | **4** instructions / cycle |
+| Domain classification | Opcode[6:5] → scalar, vector, cube, MTE |
+| Immediate extraction | Sign-extend and format-dependent extraction |
+| Branch detection | Identify branch instructions for checkpoint allocation |
+
+Instructions that cannot be expressed as a single micro-op (e.g., certain complex addressing modes) are **cracked** into 2 micro-ops at D1, consuming 2 dispatch slots.
+
+### 6.B Rename Stage (D2) — (v1 §6.2, 未变更)
+
+The rename stage performs **register renaming** for both scalar registers and tile registers using two independent Register Alias Tables (RATs). The Scalar RAT maps 32 architectural GPRs to 128 physical GPRs. The Tile RAT maps 32 architectural tile registers to 256 physical tile slots in TRegFile-4K.
+
+#### 6.B.1 Scalar RAT (v1 §6.2.1)
+
+| Parameter | Value |
+|-----------|-------|
+| Architectural registers | 32 (X0–X31) |
+| Physical registers | **128** (P0–P127) |
+| RAT storage | 32 entries × 7 bits = **224 bits** |
+| Read ports | **8** (2 sources × 4 decode slots) |
+| Write ports | **4** (1 destination × 4 decode slots) |
+
+Each RAT entry contains:
+- Physical register index (7 bits)
+- Ready bit (1 bit): set when result has been written to the physical RF
+
+#### 6.B.2 Tile RAT (Vector, Cube, MTE Operands) — (v1 §6.2.2)
+
+All three tile-consuming domains (vector, cube, MTE) share a single **Tile RAT** that renames 32 architectural tile registers (T0–T31) to 256 physical tile slots (PT0–PT255) in TRegFile-4K. This eliminates WAW and WAR hazards on tile operands through renaming, exactly as the scalar RAT does for GPRs.
+
+| Parameter | Value |
+|-----------|-------|
+| Architectural tile registers | 32 (T0–T31) |
+| Physical tile registers | **256** (PT0–PT255), 4 KB each in TRegFile-4K |
+| Tile RAT storage | 32 entries × 8 bits = **256 bits** |
+| Read ports | **8** (up to 3 source tiles × 4 decode slots, shared/muxed) |
+| Write ports | **4** (1 destination tile × 4 decode slots) |
+
+Each Tile RAT entry contains:
+- Physical tile index (8 bits)
+- Ready bit (1 bit): set when the producing operation has finished writing the physical tile
+
+Tile RAT operation mirrors scalar RAT operation: at D2, destination tile operands are allocated a fresh physical tile from the tile free list, the old physical tile mapping is marked orphan, and source tile operands are looked up to obtain the current physical tile index and ready bit. Tile instructions dispatched to Vector RS, Cube RS, and MTE RS carry **physical tile tags** (8 bits each) rather than architectural indices.
+
+#### 6.B.3 Intra-Group Bypass Logic (v1 §6.2.3)
+
+When 4 instructions are renamed simultaneously, later instructions in the group may depend on earlier ones. Hardware **priority-encoded comparators** detect these intra-group dependencies for both scalar and tile RATs:
+
+```
+  Scalar example:
+    Rename slot 0:  X5 → P40  (destination)
+    Rename slot 1:  reads X5  → comparator detects match → bypass P40
+    Rename slot 2:  X5 → P41  (re-definition)
+    Rename slot 3:  reads X5  → comparator detects slot 2 match → bypass P41
+
+    4 slots × 2 sources × 3 older slots = 24 comparators (7-bit each)
+    + 8 bypass MUXes (select forwarded phys-reg vs scalar RAT read)
+
+  Tile example:
+    Rename slot 0:  TILE.LD T10  → PT200  (destination)
+    Rename slot 1:  VADD dst=T10 → PT201  (re-definition)
+    Rename slot 2:  reads T10    → comparator detects slot 1 match → bypass PT201
+
+    4 slots × 3 tile sources × 3 older slots = 36 comparators (8-bit each)
+    + 12 bypass MUXes (select forwarded phys-tile vs Tile RAT read)
+```
+
+#### 6.B.4 Free Lists (v1 §6.2.4)
+
+| Parameter | Value |
+|-----------|-------|
+| **Scalar free list** | FIFO, 96 entries (128 physical − 32 architectural) |
+| Scalar dequeue rate | up to 4 per cycle |
+| Scalar enqueue rate | up to 4 per cycle (from ref-count freeing) |
+| **Tile free list** | FIFO, 224 entries (256 physical − 32 architectural) |
+| Tile dequeue rate | up to 4 per cycle |
+| Tile enqueue rate | up to 4 per cycle (from tile ref-count freeing) |
+
+At reset, the scalar free list is initialized with P32–P127 (first 32 pre-assigned to X0–X31). The tile free list is initialized with PT32–PT255 (first 32 pre-assigned to T0–T31).
+
+**Stall condition:** If either free list cannot supply enough physical registers for the current decode group, the rename stage stalls the pipeline.
+
+#### 6.B.5 Checkpoint Storage (Branch Recovery) — (v1 §6.2.5, 在 v2 §6.3 中扩展)
+
+| Parameter | Value (v1 baseline) |
+|-----------|---------------------|
+| Checkpoint slots | **8** (supports 8 in-flight unresolved branches) |
+| Checkpoint size (v1) | Scalar RAT (224b) + Tile RAT (256b) + scalar free-list head (7b) + tile free-list head (8b) + RAS pointer (4b) = **~499 bits** |
+| Flash-copy latency | **1 cycle** (parallel bit-copy from both active RATs) |
+| Flash-restore latency | **1 cycle** (parallel bit-copy to both active RATs) |
+
+Both the Scalar RAT and Tile RAT are checkpointed. On branch misprediction, both RATs are restored in parallel, along with both free-list head pointers.
+
+**Checkpoint lifecycle (v1 baseline):**
+
+```
+  Branch decoded at D2:
+    1. Allocate checkpoint slot (round-robin)
+    2. Flash-copy: active Scalar RAT + active Tile RAT → checkpoint[i]
+    3. Save scalar free-list head, tile free-list head, and RAS top pointer
+    4. Tag the branch's RS entry with checkpoint ID
+
+  Branch resolved correctly at EX1:
+    1. Deallocate checkpoint slot → available for reuse
+
+  Branch mispredicted at EX1:
+    1. Flash-restore: checkpoint[i] → active Scalar RAT + active Tile RAT
+    2. Restore scalar free-list head pointer (reclaim speculatively allocated GPRs)
+    3. Restore tile free-list head pointer (reclaim speculatively allocated tiles)
+    4. Restore RAS pointer
+    5. Flush all pipeline stages after D2
+    6. Redirect fetch to correct target
+```
+
+**Stall condition:** If all 8 checkpoint slots are occupied, the rename stage stalls on the next branch instruction until an older branch resolves.
+
+---
+
+### 6.1 Tile Metadata RAT (v2 增量)
 
 A new **32 b × 256 entry** SRAM stores the metadata word for each physical tile. Access pattern:
 
@@ -410,11 +894,11 @@ The Tile Metadata RAT is read at D2 alongside the regular Tile RAT lookup; the m
 
 **Storage:** 256 × 32 b = 1024 B = ~10 K gate. Read ports: 4 (one per decode slot) + 1 (TCB completion). Write ports: 2 (1 at retire, 1 for `TSETMETA`).
 
-### 6.2 Branch-tag stamping
+### 6.2 Branch-tag stamping (v2 增量)
 
 Every µop entering the rename stage receives the **current** branch_tag (the tag of the youngest unresolved branch ahead of it; or `0xFF` if none). Storing this tag on the µop's RS entry (3 b) lets the misprediction recovery logic identify which entries to flush in one cycle.
 
-### 6.3 Checkpoint extensions
+### 6.3 Checkpoint extensions (v2 增量)
 
 The 8 RAT-checkpoint slots are extended to also snapshot:
 
@@ -444,16 +928,70 @@ Updated checkpoint size:
 
 ### 7.1 Dispatch (DS)
 
-After rename, each µop dispatches into the appropriate RS along with its branch_tag.
+> **(v1 → v2: §7.1 整体语义未变,仅 Vector RS 容量从 16 → 24,理由见下表。其余 RS 容量与分发流程完整继承自 v1 §7.1。)**
 
-| RS | v1 entries | v2 entries | Sizing rationale |
-|----|------------|------------|-------------------|
-| Scalar | 32 | 32 | unchanged |
-| LSU | 24 | 24 | unchanged |
-| **Vector** | 16 | **24** | VEC-4K-v2 entries are wider (3 source tile tags + 2 dest + mask flag + xpose flags + retire mask + scalar staging tags) and multi-cycle ops occupy slots longer (`TINV` up to 33 K beats; `TMRGSORT` up to 2 912 beats — these are fewer in number than elementwise ops, but their long execute time means the RS must absorb more dispatched ops without stalling the front-end) |
-| Cube | 4 | 4 | unchanged |
-| MTE | 16 | 16 | unchanged |
-| **Total** | **92** | **100** | +8 vector RS entries |
+After rename, each µop dispatches into the appropriate RS based on its domain and operation type. Dispatch is **in-order** (preserving program order for dependency tracking), but issue from reservation stations is **out-of-order**. Each µop carries its `branch_tag` (3 b) into the RS entry alongside the v1 fields.
+
+| Reservation Station | Serves | v1 entries | v2 entries | Issue width | Sizing rationale |
+|---------------------|--------|------------|------------|-------------|------------------|
+| **Scalar RS** | 4× ALU, 1× MUL/DIV, 1× BRU | **32** | **32** | 6 (4 ALU + 1 MUL + 1 BRU) | unchanged |
+| **LSU RS** | Load unit, Store unit | **24** | **24** | 2 (1 load + 1 store) | unchanged |
+| **Vector RS** | VEC-4K-v2 ALU/FMA/PTO | **16** | **24** | 1 | VEC-4K-v2 entries are wider (3 source tile tags + 2 dest + mask flag + xpose flags + retire mask + scalar staging tags) and multi-cycle ops occupy slots longer (`TINV` up to 33 K beats; `TMRGSORT` up to 2 912 beats — fewer in number than elementwise ops, but their long execute time means the RS must absorb more dispatched ops without stalling the front-end). |
+| **Cube RS** | CUBE.OPA, CUBE.CFG, CUBE.DRAIN, CUBE.ZERO, CUBE.WAIT | **4** | **4** | 1 | unchanged |
+| **MTE RS** | TILE.LD/ST/GATHER/SCATTER/GET/PUT/COPY/TRANSPOSE | **16** | **16** | 2 | unchanged |
+| **Total** | — | **92** | **100** | — | +8 vector RS entries |
+
+#### 7.1.1 Reservation Station Sizing Rationale (v1 §7.1.1, 未变更 except Vector RS as noted)
+
+> **(v1 → v2: 以下 5 个子段中 4 个完整复制自 v1 §7.1.1。Vector RS 子段更新以反映 v2 容量提升至 24。)**
+
+The number of entries in each RS is chosen to satisfy: **(1)** absorb the execution latency of its functional units so that new instructions are not stalled waiting for RS slots, **(2)** provide enough window for out-of-order issue to find independent instructions, and **(3)** stay within area and wakeup-logic power budgets. The core principle: RS entries ≈ **dispatch rate × average occupancy time**, with headroom for dependent chains and dispatch bursts.
+
+**Scalar RS — 32 entries (v1, 未变更):**
+- The front-end dispatches up to **4 instructions/cycle**. In typical AI/HPC kernels, ~60–70% of instructions are scalar (address computation, loop control, branch), giving ~2.5–3 scalar dispatches/cycle.
+- ALU latency is **1 cycle** (result available next cycle), so independent ALU chains drain quickly. However, **MUL (4 cy)** and **DIV (12–20 cy)** are multi-cycle and block their pipeline slot while in-flight. A single DIV can occupy an issue port for up to 20 cycles.
+- With 6 issue ports, up to 6 instructions leave the RS per cycle, but dependent chains create bubbles. The RS needs enough depth to look past these stalls and find independent operations.
+- Sizing: ~3 dispatch/cy × ~8 cy average occupancy (mix of 1-cy ALU and 4-cy MUL, with occasional 20-cy DIV) ≈ 24 entries minimum. Rounded up to **32** to tolerate bursty dispatch and long DIV chains.
+- Wakeup cost: 32 entries × 2 sources × 6 CDB ports = **384 tag comparators** (7-bit each) — acceptable at 5 nm.
+
+**LSU RS — 24 entries (v1, 未变更):**
+- Load/store instructions make up ~20–30% of a typical mix, so ~0.8–1.2 dispatches/cycle.
+- **Load latency is 4 cycles** (L1 hit) but **12+ cycles** on L1 miss (L2 hit), and hundreds of cycles on DRAM access. The LSU RS must buffer many outstanding loads to exploit **memory-level parallelism (MLP)**.
+- The L1-D cache supports **8 MSHRs** (miss-status holding registers) — up to 8 cache misses can be in flight simultaneously, each occupying an RS slot for 12+ cycles.
+- Sizing: 8 MSHR-bound loads (occupying slots for ~12 cy each) + steady-state L1-hit loads and stores ≈ **24 entries**. This keeps the memory subsystem saturated with overlapping misses while allowing hit-path traffic to proceed without stalling dispatch.
+- The 2-port issue (1 load + 1 store/cycle) prevents store traffic from blocking load throughput.
+- **(v2 增量, §11.4)**: Each LSU RS entry now carries an additional 5-bit `ssb` field pointing into the Speculative Store Buffer for stores; pure loads leave it unused.
+
+**Vector RS — 24 entries (v2 update from v1's 16):**
+- Vector instructions have **high latency** (16 cycles for elementwise; up to 33 K beats for `TINV`; up to 2 912 beats for `TMRGSORT`) with epoch-pipelined throughput of **1 tile per 8 cycles** for elementwise ops. They are less frequent than scalar ops but arrive in bursts during vector-heavy code regions.
+- v2 RS entries are **wider** than v1: 3 source tile tags (was 2) + 2 destination tile tags (was 1) + mask-flag + 3 per-operand xpose bits + retire-mask + scalar staging tags. Each tile-domain entry is ~92 b (was ~80 b).
+- v2 also adds long multi-cycle PTO ops (`TINV`, `TROWRANGE_MUL`, `TMRGSORT`) that can occupy an RS slot for thousands of beats; the RS must absorb additional dispatched ops without stalling the front-end during these long ops.
+- Sizing: v1's 16 entries → v2's **24 entries** (+8 entries, +50%).
+- Tile-domain RS entries don't capture 4 KB tile data: only 8-bit tags + ready bits, so 24 entries ≈ **276 bytes**.
+
+**Cube RS — 4 entries (v1, 未变更):**
+- Cube instructions are **very long-latency** (CUBE.OPA: N+18 cycles, typically 26–82 cy) but **extremely infrequent** — a single CUBE.OPA encodes an entire K-loop of outer-product-accumulate steps spanning thousands of MAC operations.
+- A typical GEMM kernel issues 1 CUBE.OPA per ~100+ scalar/MTE instructions. Software double-buffers tile loads around cube execution, so the cube RS is rarely the dispatch bottleneck.
+- The RS only needs to hold: the currently-executing CUBE.OPA, the next queued CUBE.OPA (overlapping with tile loads for the next iteration), plus associated CUBE.CFG/CUBE.DRAIN/CUBE.WAIT control instructions.
+- Sizing: **4 entries** suffices because the instruction stream rarely has >2–3 cube instructions queued. Additional entries would waste area (including 8-bit tile tag comparators) with no throughput benefit since the cube pipeline executes 1 instruction at a time.
+
+**MTE RS — 16 entries (v1, 未变更):**
+- MTE instructions span a wide latency range: **TILE.LD: 72 cy** (L2 hit, potentially hundreds from DRAM), **TILE.ST: 72 cy**, **TILE.COPY/TRANSPOSE: 16 cy**, **TILE.ZERO: 8 cy**, **TILE.GET: 9 cy**.
+- The primary design driver is **memory-level parallelism for tile loads**: the programmer (or compiler) schedules many TILE.LD instructions ahead of the CUBE.OPA that consumes the loaded tiles. With up to **7 available write ports** and a **32-entry outstanding request buffer**, the MTE can service many concurrent tile loads.
+- At 2 issues/cycle, the MTE RS can launch 2 tile operations per cycle (e.g., 1 TILE.LD + 1 TILE.ST on separate ports).
+- Sizing: 7 concurrent TILE.LDs (one per write port) + several TILE.STs and local tile ops (GET/PUT/COPY/TRANSPOSE) + headroom for dispatch bursts ≈ **16 entries**. This provides enough scheduling window to overlap tile loads with stores and local operations, maximizing TRegFile-4K port utilization.
+- **(v2 增量, §11.5)**: Each MTE RS entry for `TILE.ST`/`TILE.SCATTER` now carries an additional 4-bit `stq` field pointing into the Speculative Tile-Store Queue.
+
+**Summary — entries vs. area (v2):**
+
+| RS | Entries | Entry width (v2) | Storage | Comparators | Dominant sizing factor |
+|----|---------|-----------------|---------|-------------|----------------------|
+| Scalar | 32 | ~178 b (+8 b btag/ssb) | ~712 B | 384 (7b × 6 CDB) | Multi-cycle MUL/DIV latency + DIV blocking |
+| LSU | 24 | ~178 b | ~534 B | 288 (7b × 6 CDB) | L1 miss latency (MLP) + 8 MSHRs + SSB |
+| Vector | **24** | **~92 b** | **~276 B** | 288 (8b × 4 TCB × 3 srcs) | 16-cy epoch latency + multi-cycle PTOs + dispatch bursts |
+| Cube | 4 | ~92 b | ~46 B | 16 (8b × 4 TCB) | Infrequent instructions, 1 in-flight |
+| MTE | 16 | ~92 b | ~184 B | 64 (8b × 4 TCB) + 96 (7b × 6 CDB) | TILE.LD MLP + 7 write ports + STQ |
+| **Total** | **100** | — | **~1752 B** | **~1136** | |
 
 ### 7.2 Reservation Station Entry Format
 
@@ -496,13 +1034,43 @@ New fields vs. v1:
 
 ### 7.3 Wakeup Logic
 
-CDB wakeup behaves as in v1: 6 CDB ports broadcast 7 b scalar tags + 64 b data; every RS entry compares against psrc1/psrc2.
+> **(v1 → v2: CDB 端语义未变,完整复制 v1 §7.3 描述。TCB 端因 VEC-4K-v2 第三源操作数被加宽,vector RS 比较器数量翻倍。)**
 
-TCB wakeup (v2 widened): 4 TCB ports broadcast 8 b tile tags. Tile-domain RS entries compare against ptsrc1/ptsrc2/ptsrc3 (3 sources × 4 ports = 12 comparators per entry × 24 vector entries = 288 comparators on the vector RS, vs. v1's 192).
+When an execution unit broadcasts a result on the **Common Data Bus (CDB)**, every reservation station entry compares its source tags against the CDB tag (v1 §7.3, 未变更):
+
+```
+  CDB broadcast: (tag=P40, data=0x1234)
+
+  For each RS entry:
+    if (psrc1 == P40 && !rdy1):  rdy1 ← 1;  data1 ← 0x1234
+    if (psrc2 == P40 && !rdy2):  rdy2 ← 1;  data2 ← 0x1234
+
+  Hardware: N entries × 2 sources × 7-bit comparators × C CDB ports
+  Scalar RS: 32 × 2 × 6 = 384 comparators (CDB has 6 write-back ports)
+```
+
+An instruction becomes **ready to issue** when `rdy1 && rdy2` (both operands available).
+
+**TCB wakeup (v2 widened):** 4 TCB ports broadcast 8 b tile tags. Tile-domain RS entries compare against ptsrc1/ptsrc2/ptsrc3 (3 sources × 4 ports = 12 comparators per entry; for the v2 24-entry vector RS this is 288 comparators, vs. v1's 16-entry × 2-source × 4 = 128).
 
 ### 7.4 Select Logic
 
-Unchanged from v1 §7.4: oldest ready instruction issues per functional unit per cycle.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §7.4。)**
+
+Each functional unit's select logic picks the **oldest ready** instruction from its reservation station every cycle:
+
+```
+  Select priority: lowest age value among entries with (valid && rdy1 && rdy2)
+
+  Per cycle:
+    Scalar RS → select up to 4 ALU + 1 MUL + 1 BRU (6 instructions)
+    LSU RS    → select 1 load + 1 store
+    Vector RS → select 1 vector op
+    Cube RS   → select 1 cube op
+    MTE RS    → select up to 2 tile ops
+```
+
+**Issue conflicts:** If multiple ready instructions target the same functional unit type and only one slot is available, the oldest wins. Younger instructions remain in the RS for the next cycle.
 
 ### 7.5 Dispatch Stall Conditions (v2 additions)
 
@@ -520,11 +1088,83 @@ Unchanged from v1 §7.4: oldest ready instruction issues per functional unit per
 
 ### 8.1 Scalar Unit
 
-**Unchanged from v1 §8.1.** 4× ALU, 1× MUL/DIV, 1× BRU; same latencies and operations.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §8.1。)**
+
+The scalar unit contains **6 functional units** sharing the Scalar RS.
+
+#### 8.1.1 ALU (×4) — (v1 §8.1.1, 未变更)
+
+Four identical single-cycle ALUs handle integer arithmetic, logic, shift, and compare operations.
+
+| Parameter | Value |
+|-----------|-------|
+| Count | **4** symmetric ALUs |
+| Operations | ADD, SUB, AND, OR, XOR, SLL, SRL, SRA, SLT, SLTU, LUI, AUIPC |
+| Latency | **1** cycle |
+| Throughput | **4** ops / cycle |
+| Input width | 64-bit |
+
+#### 8.1.2 MUL/DIV Unit (×1) — (v1 §8.1.2, 未变更)
+
+| Parameter | Value |
+|-----------|-------|
+| MUL latency | **4** cycles (pipelined, 1 MUL issued/cycle) |
+| MUL operations | MUL, MULH, MULHU, MULHSU, MULW |
+| DIV latency | **12–20** cycles (non-pipelined, blocks MUL during execution) |
+| DIV operations | DIV, DIVU, REM, REMU, DIVW, DIVUW |
+
+#### 8.1.3 Branch Unit (×1) — (v1 §8.1.3, 未变更)
+
+| Parameter | Value |
+|-----------|-------|
+| Latency | **1** cycle (compare + resolve) |
+| Operations | BEQ, BNE, BLT, BGE, BLTU, BGEU, JAL, JALR |
+| On correct prediction | Deallocate checkpoint; no pipeline impact |
+| On mispredict | Flash-restore RAT; flush pipeline stages F1–IS; redirect fetch |
+| Mispredict penalty | **6** cycles (front-end refill) |
 
 ### 8.2 Load/Store Unit (LSU)
 
-The LSU pipeline is identical to v1 in terms of address calculation, TLB access, cache lookup, and L1-D MSHRs. The **store path** is the only structural change: stores no longer commit directly to L1-D; instead, they pass through a **Speculative Store Buffer** (SSB) that gates them by branch tag.
+> **(v1 → v2: §8.2.1 架构与 §8.2.2 参数完整复制自 v1。v2 用 SSB §8.2.3 替换 v1 §8.2.3 简化提交。)**
+
+The LSU handles all scalar memory operations with a **simplified** design enabled by the no-exception guarantee. The LSU pipeline is identical to v1 in terms of address calculation, TLB access, cache lookup, and L1-D MSHRs. The **store path** is the only structural change: stores no longer commit directly to L1-D; instead, they pass through a **Speculative Store Buffer** (SSB) that gates them by branch tag.
+
+#### 8.2.A Architecture (v1 §8.2.1, 未变更)
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │  Load/Store Unit                                          │
+  │                                                          │
+  │  LSU RS (24 entries) ──┬──▶ Load Pipeline  (EX1–EX4)    │
+  │                        └──▶ Store Pipeline (EX1–EX4)    │
+  │                                                          │
+  │  ┌─────────────────┐    ┌─────────────────┐             │
+  │  │ Load Queue       │    │ Store Buffer →  │             │
+  │  │ (16 entries)     │    │  SSB (24 ent.)  │  ← v2       │
+  │  │ addr + tag       │    │ addr + data +   │             │
+  │  │                  │    │ branch_tag      │             │
+  │  └────────┬────────┘    └────────┬────────┘             │
+  │           │  store-to-load       │                       │
+  │           │◀─ forwarding ────────┘                       │
+  │           ▼                      ▼                       │
+  │      ┌──────────────────────────────┐                    │
+  │      │        L1-D Cache (64 KB)    │                    │
+  │      │    4-way, 64B line, 8 MSHRs  │                    │
+  │      └──────────────────────────────┘                    │
+  └──────────────────────────────────────────────────────────┘
+```
+
+#### 8.2.B Key Parameters (v1 §8.2.2, 未变更 except store buffer entries)
+
+| Parameter | v1 | v2 |
+|-----------|----|----|
+| Load pipeline latency | **4** cycles (address calc + TLB + cache access + align) | **4** cycles (unchanged) |
+| Store pipeline latency | **4** cycles (address calc + TLB + write to store buffer) | **4** cycles (unchanged) |
+| Load queue entries | **16** | **16** (unchanged) |
+| Store buffer entries | **16** | **24** (now SSB §11.4) |
+| Store-to-load forwarding | Full forwarding when address and size match | Full forwarding (now from SSB §11.4.3) |
+| L1-D MSHRs | **8** (non-blocking, 8 outstanding misses) | **8** (unchanged) |
+| D-TLB | 64 entries, fully associative | unchanged |
 
 #### 8.2.1 Speculative Store Buffer (SSB) — overview
 
@@ -701,9 +1341,13 @@ Per-beat `tilelet_xpose` (microcode bit per operand slot per beat) re-transposes
 
 | Op | Format | Shape | Latency |
 |----|--------|-------|---------|
-| VADD / VMUL / VFMA (full tile) | any | 1024..8192 elements | 16 cy (8 fetch + 8 retire); throughput 1/8 cy |
+| VADD / VMUL / VFMA_ACC (binary or Acc-feedback ternary) | any | 1024..8192 elements | 16 cy (8 fetch + 8 retire); throughput 1/8 cy |
+| **VFMA / VFNMA** (native 3-source, `c_role=VALUE`, §2.2.6a) | any | 1024..8192 elements | **16 cy (8 fetch on R0/R4/R1 + 8 retire); throughput 1/8 cy** — same as binary thanks to 3-port parallel fetch |
+| **VLERP** (native 3-source, dual retire D0/D1, §2.2.6a) | any | 1024..8192 elements | **24 cy (8 fetch + 16 retire); throughput 1/16 cy** |
 | VADD masked | any | any | same as unmasked (mask piggybacks) |
-| VFMA with `is_xpose_A ≠ is_xpose_B` | any | any | **24 cy** (16 fetch + 8 retire); throughput 1/16 cy |
+| VFMA_ACC with `is_xpose_A ≠ is_xpose_B` | any | any | **24 cy** (16 fetch + 8 retire); throughput 1/16 cy |
+| **VFMA with one mismatched `is_xpose_*`** | any | any | **24 cy** (16 fetch + 8 retire); throughput 1/16 cy |
+| **VFMA with all three `is_xpose_*` distinct** (degenerate) | any | any | **32 cy** (24 fetch + 8 retire); throughput 1/24 cy |
 | VROWSUM (wide, R=8 C=128 FP32) | FP32 | 8×128 | 16 cy fetch + 13 compute + 8 retire ≈ **37 cy** (recommended baseline, no cross-group tree) |
 | VROWSUM (alt config with cross-group tree) | FP32 | 8×128 | 16 + 9 + 8 = **33 cy** |
 | VCOLSUM (wide) | FP32 | 8×128 | 8 + 9 + 8 = **25 cy** |
@@ -734,11 +1378,236 @@ VEC-4K-v2 instructions are speculation-safe **inherently**: their only "external
 
 ### 8.4 Cube Unit (outerCube MXU)
 
-**Unchanged from v1 §8.4.** The cube unit benefits indirectly from the TRegFile-4K `is_transpose` enhancement: software can now feed the cube either row-major or col-major B-operand tiles by setting `is_xpose` on the cube's B-operand tile-RAT entries (the cube pipeline controller propagates the bit to TRegFile read ports R1–R4), eliminating the need for `TILE.TRANSPOSE` predecessors in many GEMM kernels. The cube ALU and accumulator are unchanged.
+> **(v1 → v2: §8.4.1 / §8.4.2 完整复制自 v1。v2 增量见本节末:cube 现可消费 TRegFile-4K 的 col-mode 读出。)**
+
+The cube unit is the outerCube Matrix Unit, a large-scale outer-product accumulation engine. Full specification is in [`outerCube.md`](outerCube.md).
+
+#### 8.4.1 Summary (v1 §8.4.1, 未变更)
+
+| Parameter | Value |
+|-----------|-------|
+| Base MAC units | **4096** (8 banks × 8 rows × 64 columns) |
+| Modes | **Mode A** (K-parallel, 8-bank reduction) / **Mode B** (M-parallel, independent) |
+| Formats | FP16, BF16, FP8 (E4M3/E5M2), MXFP4, HiFP4 |
+| MAC scaling | FP16: 4096 / FP8: 8192 / MXFP4: 32768 MACs/cycle |
+| Accumulator | 32-bit FP32, ping-pong (2 × 16 KB = 32 KB) |
+| Pipeline | 19 stages: 8 (OF) + 1 (MUL) + 1 (RED) + 1 (ACC) + 8 (AD) |
+| Staging SRAM | A double-buffer (8 KB) + B double-buffer (32 KB) = 40 KB baseline |
+| Peak FP16 @ 1.5 GHz | **12.3 TFLOPS** |
+| Peak FP8 @ 1.5 GHz | **24.6 TOPS** |
+| Peak MXFP4 @ 1.5 GHz | **98.3 TOPS** |
+
+#### 8.4.2 Cube Instruction Dispatch (v1 §8.4.2, 未变更)
+
+Cube instructions (CUBE.OPA, CUBE.DRAIN, etc.) are dispatched to the **Cube RS** (4 entries) after Tile RAT rename. Each CUBE.OPA is a long-running instruction that occupies the MXU for many cycles (N + 18, where N = Nb × S OPA steps). While the MXU is busy, the Cube RS holds subsequent cube instructions until the current one completes.
+
+A CUBE.OPA may reference a range of architectural tile registers (e.g., T[Tb]..T[Tb+Na−1]). At dispatch, the Tile RAT translates each architectural tile index to a physical tile index. For multi-tile operands, the cube RS stores a base physical tile index plus a **tile address table** (up to 16 entries) holding the physical indices of all tiles in the range; the cube pipeline controller uses these physical indices to program TRegFile-4K port addresses.
+
+The cube unit reads tile data from TRegFile-4K ports R0 (A operand) and R1–R4 (B operand), and drains results via W0 (C output). Port interactions are managed by the cube pipeline controller, which issues epoch-aligned physical tile addresses to TRegFile-4K's pending registers (see [`tregfile4k.md`](tregfile4k.md) §3).
+
+#### 8.4.3 v2 增量(对硬件不可见)
+
+The cube unit benefits indirectly from the TRegFile-4K `is_transpose` enhancement: software can now feed the cube either row-major or col-major B-operand tiles by setting `is_xpose` on the cube's B-operand tile-RAT entries (the cube pipeline controller propagates the bit to TRegFile read ports R1–R4), eliminating the need for `TILE.TRANSPOSE` predecessors in many GEMM kernels. The cube ALU, accumulator, and pipeline are otherwise unchanged.
 
 ### 8.5 MTE Unit
 
-The MTE unit retains the v1 architecture (§8.5 of v1) for `TILE.LD`, `TILE.GATHER`, `TILE.ZERO`, `TILE.COPY`, `TILE.GET`, `TILE.PUT`, and `TILE.MOVE`. Three v2 changes:
+> **(v1 → v2: §8.5.A / §8.5.B / §8.5.C / §8.5.D 完整复制自 v1 §8.5.1 / §8.5.2 / §8.5.3 / §8.5.4 / §8.5.5。v2 增量集中在 §8.5.1 (TRANSPOSE 缩减) 与 §8.5.2 (STQ)。)**
+
+The MTE unit is the **bridge between three domains**: memory ↔ TRegFile-4K (bulk tile transfers) and scalar GPR ↔ TRegFile-4K (single-element access via TILE.GET/TILE.PUT). All MTE instructions go through full **dual-RAT rename** at D2: scalar operands are renamed via the Scalar RAT, and tile operands are renamed via the Tile RAT. Instructions that produce a new tile (TILE.LD, TILE.ZERO, TILE.COPY, TILE.GATHER, TILE.PUT) allocate a fresh physical tile from the tile free list. TILE.GET produces a scalar GPR result and broadcasts on the CDB.
+
+#### 8.5.A Architecture (v1 §8.5.1, 未变更)
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Memory Tile Engine (MTE)                                        │
+  │                                                                  │
+  │  MTE RS (16 entries) ──┬──▶ Load Tile Pipeline                  │
+  │                        ├──▶ Store Tile Pipeline ──▶ STQ (v2)    │
+  │                        ├──▶ Gather Pipeline                     │
+  │                        ├──▶ Scatter Pipeline ──▶ STQ (v2)       │
+  │                        ├──▶ TILE.GET Pipeline (tile→GPR)        │
+  │                        └──▶ TILE.PUT Pipeline (GPR→tile, RMW)   │
+  │                                                                  │
+  │  ┌──────────────────────────────┐                                │
+  │  │ Outstanding Request Buffer   │  Tracks up to 32 in-flight    │
+  │  │ (32 entries)                 │  tile transfers for MLP        │
+  │  └──────────────┬───────────────┘                                │
+  │                 │                                                │
+  │  ┌──────────────▼───────────────┐  ┌─────────────────────────┐  │
+  │  │ Address Generation Unit      │  │ Data Assembly / Scatter  │  │
+  │  │ (contiguous, strided, index) │  │ (pack / unpack for G/S)  │  │
+  │  └──────────────┬───────────────┘  └──────────┬──────────────┘  │
+  │                 │                              │                 │
+  │                 ▼                              ▼                 │
+  │  ┌──────────────────────────────────────────────────┐           │
+  │  │  L2 / Memory Interface (high-bandwidth path)     │           │
+  │  │  64 B/cy (1 cache line/cy) sustained              │           │
+  │  └──────────────────────────────────────────────────┘           │
+  │                 │                              │                 │
+  │                 ▼                              ▼                 │
+  │  ┌──────────────────────────────────────────────────┐           │
+  │  │  TRegFile-4K Write Ports (W1–W7 for TILE.LD)    │           │
+  │  │  TRegFile-4K Read Ports (R5–R7 for TILE.ST)     │           │
+  │  └──────────────────────────────────────────────────┘           │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────┐           │
+  │  │  Scalar GPR ↔ Tile Element Path                  │           │
+  │  │  TILE.GET: TRegFile read port → extract → CDB    │           │
+  │  │  TILE.PUT: CDB snoop → tile copy + insert → write│           │
+  │  └──────────────────────────────────────────────────┘           │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.5.B Key Parameters (v1 §8.5.2, 未变更)
+
+| Parameter | Value |
+|-----------|-------|
+| TILE.LD TRegFile write | **8 cycles** per write port (512 B/cy × 8 cy = 4 KB) |
+| TILE.LD total latency (L2 hit) | **72 cycles** (64 cy memory fetch + 8 cy TRegFile write epoch) |
+| TILE.ST TRegFile read | **8 cycles** per read port (512 B/cy × 8 cy = 4 KB) |
+| TILE.ST total latency (L2) | **72 cycles** (8 cy TRegFile read epoch + 64 cy memory write) |
+| Available write ports | W1–W7 (**7** ports, minus ports used by cube drain) |
+| Available read ports | R5–R7 (**3** ports, minus ports used by cube operands) |
+| Max concurrent TILE.LD | up to **7** (1 per write port), limited by memory BW |
+| Max concurrent TILE.ST | up to **3** (1 per read port) |
+| Outstanding request buffer | **32** entries (supports deep memory-level parallelism) |
+| Gather/scatter | Uses index tile (Tidx) for non-contiguous access patterns |
+| L2 → MTE bandwidth | **64 B/cy** (1 cache line/cy) → 1 tile in **64 cycles** from L2 |
+| TILE.COPY / TILE.TRANSPOSE latency | **16 cycles** (8 cy TRegFile read epoch + 8 cy write epoch) |
+| TILE.ZERO latency | **8 cycles** (1 write epoch, no read needed) |
+| **TILE.GET latency** | **9 cycles** (8 cy TRegFile read epoch + 1 cy element extract → CDB) |
+| **TILE.PUT latency** | **16 cycles** (8 cy read epoch + 8 cy write epoch); **8 cy** with copy elision |
+| TILE.GET throughput | **1 per 8 cycles** (read port occupied for full epoch even for single element) |
+| TILE.PUT throughput | **1 per 16 cycles** (read + write port, 2 epochs); **1 per 8 cy** with elision |
+
+#### 8.5.C MTE Rename → Issue → Execute Flow (Bulk Transfer) — (v1 §8.5.3, 未变更)
+
+```
+  D2 (Rename):
+    TILE.LD T10, [X5]
+      Scalar RAT: X5 → P40 (physical scalar for base address)
+      Tile RAT:   T10 → PT200 (allocate new physical tile from tile free list)
+                  old mapping PT10 marked orphan
+      Tile RAT ready[PT200] ← 0
+
+  DS (Dispatch):
+    MTE RS entry: {op=TILE.LD, pscalar=P40, srdy=<from Scalar RAT>, ptdst=PT200, ckpt=...}
+
+  IS (Issue):
+    Wait for pscalar P40 ready (CDB wakeup from scalar ALU)
+    → read base address from scalar physical RF
+
+  EX (Execute — memory fetch + 1 TRegFile write epoch):
+    Memory phase (≈64 cycles from L2):
+        MTE Address Gen: compute contiguous address range from base address
+        MTE Data Path:   request 64 cache lines from L2 (64 B/cy)
+        MTE Buffer:      accumulate 4 KB in outstanding request buffer
+    TRegFile write epoch (8 cycles):
+        Reserve write port, program reg_idx = PT200
+        Write 512 B/cy × 8 cy = 4 KB to physical tile slot PT200
+    Total TILE.LD latency (L2 hit): 64 + 8 = **72 cycles**
+
+  Complete:
+    Tile RAT ready[PT200] ← 1
+    TCB broadcast: PT200
+    → wake dependent instructions in Vector RS, Cube RS, MTE RS
+    Decrement tile refcount for any source tiles
+```
+
+MTE bulk operations incur both **memory latency** and **TRegFile epoch latency**. For TILE.LD, the MTE first fetches 4 KB from memory (64 cache lines at 64 B/cy = 64 cycles from L2), buffers the data, then writes to TRegFile-4K in one 8-cycle write epoch using the **physical tile index** (from Tile RAT) as the `reg_idx` address — total latency: **memory + 8 cycles**. For TILE.ST, the MTE first reads the tile from TRegFile in one 8-cycle read epoch, then writes the data to memory — total: **8 cycles + memory**. The MTE controller issues physical `reg_idx` addresses to port pending registers and sequences data transfer across each 8-cycle epoch.
+
+#### 8.5.D TILE.GET / TILE.PUT Execution Flow (Element Access) — (v1 §8.5.4, 未变更)
+
+**TILE.GET Rd, Ts, Ridx** — scalar ← tile element:
+
+```
+  D2 (Rename):
+    Scalar RAT: Ridx → P50 (lookup index);  Rd → P60 (allocate new scalar dest)
+    Tile RAT:   Ts → PT180 (lookup source tile)
+
+  DS (Dispatch):
+    MTE RS entry: {op=TILE.GET, pscalar=P50(Ridx), srdy, pdst=P60(Rd), ptsrc1=PT180(Ts), trdy}
+
+  IS (Issue):
+    Wait for P50 ready (CDB wakeup) AND PT180 ready (TCB wakeup)
+    → read index value from scalar RF; compute row_group = row / 8, row_off, col
+
+  EX (Execute, 9 cycles):
+    Cycles 1–8: TRegFile read epoch — reserve read port for physical tile PT180
+                port reads 512 B/cy × 8 cy (full tile streamed out);
+                capture the 512-B chunk at cycle (row_group+1) containing target row
+    Cycle 9:    extract element from captured 512-bit row based on col and
+                funct3 (element type), zero-extend to 64 bits
+
+  Complete:
+    CDB broadcast: (tag=P60, data=element_value)
+    → wakeup dependent scalar RS entries; write to scalar physical RF
+    Decrement tile refcount for PT180
+```
+
+**TILE.PUT Td, Rs, Ridx** — tile element ← scalar (read-modify-write):
+
+```
+  D2 (Rename):
+    Scalar RAT: Rs → P70 (lookup data), Ridx → P71 (lookup index)
+    Tile RAT:   Td old mapping → PT180 (source, for tile copy)
+                Td new mapping → PT210 (allocate from tile free list)
+                PT180 marked orphan; ready[PT210] ← 0
+
+  DS (Dispatch):
+    MTE RS entry: {op=TILE.PUT, pscalar=P70(Rs), pscalar2=P71(Ridx),
+                   ptsrc1=PT180(Td_old), ptdst=PT210(Td_new)}
+
+  IS (Issue):
+    Wait for P70, P71 ready (CDB) AND PT180 ready (TCB)
+
+  EX (Execute, 16 cycles — 2 full TRegFile epochs):
+    Read epoch (cycles 1–8):
+        Reserve read port for physical tile PT180
+        Read 512 B/cy × 8 cy = 4 KB (full source tile)
+        Buffer tile data in MTE internal SRAM; overwrite target element
+        at (row, col) derived from Ridx with scalar value from Rs
+    Write epoch (cycles 9–16):
+        Reserve write port for physical tile PT210
+        Write modified tile 512 B/cy × 8 cy = 4 KB to PT210
+
+    Copy elision optimisation (8 cycles):
+        When PT180 refcount=0 and is orphaned at rename, the copy is
+        skipped. PT210 reuses PT180's storage. Only the target element
+        is overwritten in-place during a single write epoch (8 cy).
+
+  Complete:
+    Tile RAT ready[PT210] ← 1
+    TCB broadcast: PT210
+    → wake dependent tile-domain RS entries
+    Decrement tile refcount for PT180; if orphan and refcount=0 → free PT180
+```
+
+TILE.GET occupies a TRegFile read port for a full 8-cycle epoch (even though only one 512-B chunk is needed), plus 1 cycle for element extraction — **9 cycles** total. TILE.PUT requires two full epochs (8 cy read + 8 cy write = **16 cycles**) because it is a read-modify-write on the tile. With copy elision (PT_old orphaned, refcount=0), the read epoch is skipped and only the write epoch is needed — reducing latency to **8 cycles**.
+
+#### 8.5.E TILE.MOVE (Move Elimination) — (v1 §8.5.5, 未变更)
+
+**TILE.MOVE Td, Ts** — Handled entirely at the D2 rename stage with **zero-cycle latency**:
+
+```
+  D2 (Rename):
+    TILE.MOVE T5, T10
+      Tile RAT[T10] → PT180 (source physical tile)
+      Tile RAT[T5]  → PT50  (old destination mapping, marked orphan)
+      Tile RAT[T5]  ← PT180 (Td now aliases same physical tile as Ts)
+      refcount(PT180) += 1   (extra architectural name)
+      ready[T5] = ready[PT180]  (inherit readiness)
+      → No RS entry allocated. No execute. No TCB broadcast.
+      → Instruction completes immediately at D2.
+
+  If PT50 is orphan and refcount==0 → free PT50 to tile free list
+```
+
+TILE.MOVE does not consume any execute-stage resources, TRegFile-4K ports, or memory bandwidth. It is the preferred way to "rename" tiles between software pipeline stages (e.g., double-buffering schemes where the next iteration's input tiles become the current iteration's operand tiles). Because Td and Ts share the same physical tile after TILE.MOVE, the next write to either architectural register will naturally allocate a new physical tile at rename time.
+
+---
+
+**v2 增量(下面 §8.5.1 / §8.5.2 / §8.5.3 / §8.5.4):**
 
 #### 8.5.1 `TILE.TRANSPOSE` — reduced footprint
 
@@ -798,7 +1667,28 @@ The `TILE.ST` and `TILE.SCATTER` entries gain a 4 b STQ index. Other MTE instruc
 
 ### 9.1 Scalar GPR Physical Register File
 
-**Unchanged from v1 §9.1.** 128 × 64 b, 12R + 6W, flip-flop array.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §9.1。)**
+
+| Parameter | Value |
+|-----------|-------|
+| Physical registers | **128** (P0–P127), 64-bit each |
+| Total storage | 128 × 8 B = **1 KB** |
+| Read ports | **12** (8 from rename lookup + 4 from issue/execute) |
+| Write ports | **6** (4 ALU + 1 MUL/LSU + 1 TILE.GET), matched to CDB ports |
+| Implementation | Flip-flop array (small enough for full-speed multi-port) |
+| Bypass network | 6-source → 12-sink forwarding MUXes |
+
+**Bypass network:** When a result is broadcast on the CDB in the same cycle that an issuing instruction reads the physical RF, the bypass network forwards the CDB data directly to the execution unit input, avoiding a 1-cycle read-after-write penalty.
+
+**Register lifecycle:**
+
+```
+  Allocate:  free list dequeue → assigned as destination at D2
+  Write:     execution unit writes result at WB stage
+  Read:      issuing instructions read at IS stage (or snoop from CDB)
+  Orphan:    a later instruction remaps the same architectural register
+  Free:      orphan AND reference count = 0 → return to free list
+```
 
 ### 9.2 TRegFile-4K (with per-port `is_transpose`)
 
@@ -856,36 +1746,208 @@ VEC-4K-v2 binding: **R0 (Port A, with `is_xpose_A`)**, **R4 (Port B, with `is_xp
 
 ## 10. Out-of-Order Execution Model — Foundations
 
-(This section recapitulates the ROB-less OoO model from v1 §10. The new speculation-recovery mechanism is in **§11**.)
+> **(v1 → v2: 本章基础部分完整复制自 v1 §10。v2 增量为 Tile Metadata RAT(§10.3 引用)与 §10.6 指向 §11 的扩展投机恢复机制。)**
 
-### 10.1 Core principles (unchanged)
+The Davinci-v2 core implements a **ROB-less out-of-order** execution model. Because the core does not need to maintain precise architectural state (no interrupts, no exceptions in run-to-completion kernels), it dispenses with the Reorder Buffer entirely. This section describes how instructions flow through the core and how correctness is maintained.
 
-1. **OoO dispatch, OoO execution, OoO completion.** Results commit to the physical register file as soon as execution completes; no in-order retirement stage.
-2. **False dependencies (WAW, WAR) eliminated by register renaming.** Both Scalar RAT (32→128) and Tile RAT (32→256) — plus the new Tile Metadata RAT — assign each destination to a unique physical register/tile.
-3. **True dependencies (RAW) resolved by tag-based wakeup.** Scalar via CDB, tile via TCB.
-4. **Branch recovery via RAT checkpoints.** On mispredict, three RATs (Scalar, Tile, Tile-Metadata) are flash-restored in 1 cycle; all younger instructions are flushed. v2 extends this with branch-tag-driven SSB / STQ flush (§11).
-5. **Physical registers freed by reference counting.** Scalar (4 b refcount), tile (3 b refcount). Same as v1.
+### 10.1 Core Principles (v1 §10.1, 未变更; v2 增加第 6 条)
 
-### 10.2 Instruction Lifecycle (unchanged from v1 §10.2)
+1. **OoO dispatch, OoO execution, OoO completion.** An instruction's result is committed to the physical register file as soon as execution completes. There is no in-order retirement stage.
+2. **False dependencies (WAW, WAR) eliminated by register renaming.** Both the Scalar RAT (32→128) and Tile RAT (32→256) — and the new v2 **Tile Metadata RAT** — assign each destination to a unique physical register/tile, so no instruction ever overwrites another's live data.
+3. **True dependencies (RAW) resolved by tag-based wakeup.** Scalar instructions wait for source tags on the CDB. Tile-domain instructions wait for Tile RAT ready bits signaling physical tile completion.
+4. **Branch recovery via RAT checkpoints.** On mispredict, both the Scalar RAT and Tile RAT are flash-restored in 1 cycle; all younger instructions are flushed.
+5. **Physical registers freed by reference counting.** No ROB means no retirement-based freeing; instead, a register (scalar or tile) is freed when it is both *orphaned* (no longer the current mapping for any architectural register) and its reference count reaches zero.
+6. **(v2 增量) Speculative memory side effects gated by branch tag.** Speculative scalar stores live in the SSB and speculative bulk tile stores live in the STQ until their `branch_tag` resolves to non-speculative. See §11.
+
+### 10.2 Instruction Lifecycle (v1 §10.2, 未变更)
+
+```
+  ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐
+  │Fetch│──▶│Decode│──▶│Rename│──▶│ Disp│──▶│Issue│──▶│ Exec│──▶│  WB │
+  │ F1-2│   │  D1  │   │  D2  │   │ DS  │   │ IS  │   │EX1-n│   │     │
+  └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘
+                         │                                         │
+                    Allocate P-reg                          Write P-reg
+                    Update RAT                             Broadcast CDB
+                    Checkpoint (branch)                    Wakeup dependents
+                    Increment ref-counts                   Decrement ref-counts
+                                                           Free orphans (refcnt=0)
+```
+
+Detailed per-stage actions (v1 §10.2 + v2 增量 in italics):
+
+| Stage | Actions |
+|-------|---------|
+| **Fetch (F1–F2)** | PC → I-cache + branch predictor; receive 4 instructions |
+| **Decode (D1)** | Decode opcode, identify domain, extract fields |
+| **Rename (D2)** | Read Scalar RAT / Tile RAT for sources (get physical tags + ready bits); allocate physical dest from appropriate free list; update RAT; increment ref-counts for source physical regs/tiles; if branch: allocate + flash-copy both RAT checkpoints. *(v2: also stamp branch_tag on µop; if branch, allocate branch_tag from 8-slot pool, snapshot SSB head + STQ head into checkpoint)*. |
+| **Dispatch (DS)** | Write entry into target RS with opcode, source tags, ready bits, dest tag. *(v2: include branch_tag; allocate SSB slot for stores, STQ slot for bulk tile stores)*. |
+| **Issue (IS)** | Select oldest ready entry; read physical RF for operands not yet captured |
+| **Execute (EX)** | Compute result (variable latency per unit). *(v2: scalar stores deposit into SSB slot, MTE bulk stores deposit address+data-ptr into STQ slot — no L1-D / memory write yet)*. |
+| **Writeback (WB)** | Scalar: broadcast (tag, data) on CDB; write result to physical RF; set ready bit in Scalar RAT; wakeup dependent RS entries. Tile: write data to physical tile in TRegFile-4K; set ready bit in Tile RAT; wakeup dependent tile RS entries. Both: decrement ref-counts for source regs/tiles; if source is orphan and refcnt=0: free it. *(v2: SSB / STQ entries become drain-ready when their branch_tag clears; data/tile actually commits to L1-D / external memory only on drain.)* |
 
 ### 10.3 Register Alias Table (RAT) Operation
 
-Three RATs in v2 (vs. two in v1):
+> **(v1 → v2: 复制自 v1 §10.3。v2 在 Tile RAT 旁增加了 Tile Metadata RAT,语义见 §6.1。)**
 
-- Scalar RAT (32 → 128) — unchanged from v1
-- Tile RAT (32 → 256) — unchanged in geometry; receives one additional companion structure:
-- **Tile Metadata RAT** (256 × 32 b, §6.1, §9.2.1) — a sibling structure that holds `(shape.x, shape.y, format)` per physical tile. It is *not* renamed in the same sense as the Tile RAT; it is updated by retire-time writes from producing instructions.
+The two RATs (Scalar and Tile) plus the new Tile Metadata RAT are the core state machines of the processor. In the absence of a ROB, the RATs are the **definitive mapping** from architectural to physical registers.
+
+**Scalar RAT rename example (4-wide, single cycle, v1, 未变更):**
+
+```
+  Instruction stream:
+    i0:  ADD  X5, X2, X3
+    i1:  MUL  X6, X5, X7
+    i2:  SUB  X5, X8, X9
+    i3:  ADD  X10, X5, X6
+
+  Before rename:
+    Scalar RAT: X2→P2, X3→P3, X5→P5, X7→P7, X8→P8, X9→P9
+
+  Rename (all in one cycle at D2):
+    i0: src1=P2, src2=P3, dst=P40 (new);  RAT: X5→P40;  P5 marked orphan
+    i1: src1=P40 (bypass from i0), src2=P7, dst=P41;  RAT: X6→P41
+    i2: src1=P8, src2=P9, dst=P42 (new);  RAT: X5→P42;  P40 marked orphan
+    i3: src1=P42 (bypass from i2), src2=P41 (bypass from i1), dst=P43;  RAT: X10→P43
+
+  After rename:
+    Scalar RAT: X2→P2, X3→P3, X5→P42, X6→P41, X7→P7, X8→P8, X9→P9, X10→P43
+    Orphans: P5 (old X5), P40 (old X5, transient within group)
+    Free when: orphan AND refcount=0
+```
+
+**Tile RAT rename example (v1, 未变更):**
+
+```
+  Instruction stream:
+    i0:  TILE.LD  T10, [X5]            (scalar src X5, tile dst T10)
+    i1:  TILE.LD  T20, [X6]            (scalar src X6, tile dst T20)
+    i2:  VADD     T10, T10, T20        (tile src T10, T20; tile dst T10)
+    i3:  TILE.ST  [X7], T10            (scalar src X7, tile src T10)
+
+  Before rename:
+    Tile RAT: T10→PT10, T20→PT20
+
+  Rename (all in one cycle at D2):
+    i0: scalar src=<from Scalar RAT>, tile dst=PT100 (new);  Tile RAT: T10→PT100;  PT10 orphaned
+    i1: scalar src=<from Scalar RAT>, tile dst=PT101 (new);  Tile RAT: T20→PT101;  PT20 orphaned
+    i2: tile src1=PT100 (bypass i0), tile src2=PT101 (bypass i1),
+        tile dst=PT102 (new);  Tile RAT: T10→PT102;  PT100 orphaned
+    i3: tile src=PT102 (bypass i2);  no tile dst (store)
+
+  After rename:
+    Tile RAT: T10→PT102, T20→PT101
+    Tile orphans: PT10 (old T10), PT20 (old T20), PT100 (old T10, transient)
+    Free when: orphan AND tile refcount=0
+```
+
+**Tile Metadata RAT (v2 增量):** A 256 × 32 b sibling SRAM holding `(shape.x, shape.y, format)` per physical tile. Updated by retire-time writes from producing instructions; read together with the tile's first strip during operand fetch (§9.2.1).
 
 ### 10.4 Common Data Bus / Tile Completion Bus
 
-- CDB: 6 ports (4 ALU + 1 MUL/LSU + 1 TILE.GET) — **unchanged from v1**.
-- TCB: 4 ports (Vector, Cube, MTE, MTE) — **unchanged in port count**, but with one additional payload bit per port indicating "metadata committed" (tells consumers that the tile metadata has been written and is safe to read).
+> **(v1 → v2: 端口数 / 数据线宽完整复制自 v1 §10.4。v2 在 TCB 每端口增加 1 b "metadata committed" 标志。)**
 
-### 10.5 Reference counting
+The CDB is a broadcast network connecting execution unit outputs to reservation stations and the physical register file.
 
-**Unchanged from v1 §10.5.** 4 b refcount per scalar physical register, 3 b refcount per physical tile. Lifecycle: MAPPED → ORPHAN → FREE.
+| Parameter | Value |
+|-----------|-------|
+| CDB ports | **6** (4 ALU + 1 MUL/LSU + 1 TILE.GET) |
+| Broadcast width | 7-bit tag + 64-bit data per port |
+| Snoop points | All RS entries (32+24+24+4+16 = 100 entries × 2 scalar sources in v2) |
 
-### 10.6 Branch recovery — pointer to §11
+The CDB carries scalar physical register tags and 64-bit data. Instructions that produce tile results use the **Tile Completion Bus (TCB)** instead. The CDB is used by:
+- Scalar ALU, MUL/DIV, Branch, LSU results (5 ports)
+- **TILE.GET** that produces a scalar GPR result (shared port 6)
+
+**Tile Completion Bus (TCB):** A lightweight broadcast network (8-bit physical tile tag, no data payload, **+1 b metadata-committed in v2**) with **4 ports** supporting up to 4 simultaneous tile completions per cycle. TCB port allocation:
+
+| TCB port | Source |
+|----------|--------|
+| TCB0 | Vector unit (VEC-4K-v2 ALU/FMA/PTO destination tile) |
+| TCB1 | Cube unit (CUBE.DRAIN destination tile) |
+| TCB2 | MTE unit — TILE.LD / TILE.GATHER / TILE.ZERO / TILE.COPY / TILE.PUT completion (port 1) |
+| TCB3 | MTE unit — TILE.LD / TILE.GATHER / TILE.ZERO / TILE.COPY / TILE.PUT completion (port 2) |
+
+Each tile-domain RS entry compares its physical tile source tags against all 4 TCB tags for wakeup, mirroring CDB wakeup for scalar RS entries. MTE instructions that do not produce a tile destination (TILE.ST, TILE.SCATTER) do not broadcast on the TCB.
+
+Each CDB port can broadcast one result per cycle. When a result is broadcast (v1 §10.4, 未变更):
+
+1. **Wakeup:** Every scalar/LSU RS entry compares its source tags against the broadcast tag. On match, the ready bit is set and data is captured.
+2. **RF write:** The physical register file captures the data at the destination tag.
+3. **RAT status:** The ready bit for the physical register is set in the RAT status table.
+
+### 10.5 Physical Register Freeing (Reference Counting)
+
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §10.5。)**
+
+Without a ROB, the processor cannot use retirement to determine when a physical register is dead. Instead, it uses a **reference counting** scheme, applied identically to both scalar physical registers and physical tile registers:
+
+```
+  Per physical scalar register (128 entries):
+    ┌──────────┬──────────┬───────────┐
+    │ orphan   │ refcount │ state     │
+    │ (1 bit)  │ (4 bits) │           │
+    └──────────┴──────────┴───────────┘
+
+  Per physical tile register (256 entries):
+    ┌──────────┬──────────┬───────────┐
+    │ orphan   │ refcount │ state     │
+    │ (1 bit)  │ (3 bits) │           │
+    └──────────┴──────────┴───────────┘
+
+  State machine (same for both):
+    MAPPED:   RAT points to this register; refcount tracks in-flight readers
+    ORPHAN:   RAT no longer points here (remapped); refcount may be > 0
+    FREE:     orphan AND refcount == 0 → returned to free list
+```
+
+Tile refcount is 3 bits (max 7 concurrent readers per physical tile), which suffices because the Vector RS (24 in v2), Cube RS (4), and MTE RS (16) issue at most a few readers per tile simultaneously. Scalar refcount is 4 bits (max 15).
+
+**Lifecycle events (identical for scalar and tile):**
+
+| Event | orphan | refcount | Action |
+|-------|--------|----------|--------|
+| Allocated as destination at D2 | 0 | 0 | Added to RAT mapping |
+| Instruction reads this register (dispatched to RS) | — | +1 | Reader registered |
+| Reader completes execution (reads at IS/EX) | — | −1 | Reader done |
+| RAT remaps arch-reg to new physical register | 1 | — | Old mapping becomes orphan |
+| refcount reaches 0 while orphan=1 | 1 | 0 | **Free**: return to free list |
+
+**Branch misprediction and ref-counts:** When a mispredict occurs, all instructions younger than the branch are flushed. Their RS entries are invalidated, and the ref-counts for their source registers (scalar and tile) are decremented. Physical registers/tiles allocated as destinations by flushed instructions are returned directly to their respective free lists. Both free list head pointers are restored from the checkpoint to reclaim all speculatively allocated registers.
+
+### 10.6 Branch Recovery
+
+> **(v1 → v2: v1 的 1-cycle dual-RAT restore 序列完整保留;v2 在并行加上 SSB/STQ flush。详细投机恢复机制见 §11。)**
+
+```
+  ┌────────────────────────────────────────────────────────────┐
+  │  Branch Misprediction Recovery (v1 baseline + v2 增量)     │
+  │                                                            │
+  │  Cycle 0: Branch resolves as MISPREDICTED at EX1          │
+  │    → Identify checkpoint ID and branch_tag from RS entry  │
+  │                                                            │
+  │  Cycle 1: Recovery actions (all in parallel):              │
+  │    a) Flash-restore: checkpoint[id] → active Scalar RAT   │
+  │    b) Flash-restore: checkpoint[id] → active Tile RAT     │
+  │    c) Restore scalar free-list head pointer                │
+  │    d) Restore tile free-list head pointer                  │
+  │    e) Restore RAS top pointer from checkpoint              │
+  │    f) Invalidate all RS entries younger than branch         │
+  │    g) Decrement ref-counts (scalar + tile) for flushed ops │
+  │    h) Deallocate all checkpoints younger than this branch  │
+  │    i) (v2) Flush SSB entries with btag = mispredict_tag    │
+  │       or any descendant tag (parallel CAM clear, §11.4.4)  │
+  │    j) (v2) Flush STQ entries similarly (§11.5.1)           │
+  │    k) (v2) Reset Tile-Metadata RAT delta-tag from checkpt  │
+  │                                                            │
+  │  Cycle 2: Redirect fetch PC to correct branch target       │
+  │                                                            │
+  │  Cycle 3+: New instructions begin entering F1               │
+  │                                                            │
+  │  Total penalty: 6 cy (v1) → 6 cy (v2; SSB/STQ flush is     │
+  │                       parallel and adds 0 cy hot-path)     │
+  └────────────────────────────────────────────────────────────┘
+```
 
 The basic v1 branch-recovery sequence (RAT flash-restore, free-list-head restore, RS flush) is preserved. **Section 11 specifies the additional mechanisms required for safe speculative execution beyond branch prediction**: SSB / STQ flush, branch-tag ancestry tracking, and the proof that this set of mechanisms is **sufficient to keep architectural state correct without a Reorder Buffer**.
 
@@ -1192,41 +2254,197 @@ This is **~3.5%** of the ~3.26 mm² total core area (v1) — far less than a com
 
 ## 12. Memory Subsystem
 
-The memory subsystem is structurally identical to v1 §11. The two changes are integration points for the SSB and STQ:
+> **(v1 → v2: §12.1 / §12.3 / §12.4 / §12.5 完整复制自 v1 §11。v2 增量集中在 §12.2 Store path,把 v1 的 16-entry store buffer 升级为 24-entry SSB,并加入 STQ。)**
 
-### 12.1 Cache hierarchy
+The memory subsystem is structurally identical to v1 §11. The two changes are integration points for the SSB and STQ.
 
-**Unchanged from v1.** L1-I 64 KB / L1-D 64 KB / L2 512 KB.
-
-### 12.2 Store path
+### 12.1 Cache Hierarchy (v1 §11.1, 未变更)
 
 ```
-  Scalar store:      LSU-RS → SSB → L1-D (only on tag-clear)
-  Bulk tile store:   MTE-RS → STQ → MTE memory pipeline → L2 (only on tag-clear)
+  ┌────────────┐    ┌────────────┐
+  │  L1-I      │    │  L1-D      │
+  │  64 KB     │    │  64 KB     │
+  │  4-way     │    │  4-way     │
+  │  2-cy lat  │    │  4-cy lat  │
+  └─────┬──────┘    └─────┬──────┘
+        │                 │
+        └────────┬────────┘
+                 ▼
+        ┌────────────────┐
+        │  L2 (Unified)  │
+        │  512 KB        │
+        │  8-way         │
+        │  12-cy lat     │
+        └───────┬────────┘
+                │
+                ▼
+        External Bus / NoC
 ```
 
-The L1-D's existing 8 MSHRs and 4-cy store pipeline are unchanged. The SSB inserts in front of L1-D as a CAM-addressable forwarding buffer; it already played that role in v1's 16-entry store buffer, so the L1-D interface is unchanged.
+| Cache | Size | Associativity | Line size | Latency | Ports | MSHRs |
+|-------|------|---------------|-----------|---------|-------|-------|
+| L1-I | **64 KB** | 4-way | 64 B | **2** cycles | 1 read (fetch) | 4 |
+| L1-D | **64 KB** | 4-way | 64 B | **4** cycles | 1 read + 1 write (LSU) | 8 |
+| L2 | **512 KB** | 8-way | 64 B | **12** cycles | 1 read + 1 write | 16 |
 
-### 12.3 TLB and address translation
+### 12.2 Store Path (v2 增量)
 
-**Unchanged from v1 §11.2.**
+```
+  Scalar store:      LSU-RS → SSB (24 entries) → L1-D (only on tag-clear)
+  Bulk tile store:   MTE-RS → STQ (8 entries)  → MTE memory pipeline → L2 (only on tag-clear)
+```
 
-### 12.4 Memory ordering
+The L1-D's existing 8 MSHRs and 4-cy store pipeline are unchanged. The SSB inserts in front of L1-D as a CAM-addressable forwarding buffer; it already played that role in v1's 16-entry store buffer, so the L1-D interface is unchanged. v2 widens the buffer to 24 entries and adds branch-tag gating (full design in §11.4).
+
+| Property | v1 store buffer | v2 SSB |
+|----------|-----------------|--------|
+| Entries | 16 | **24** |
+| Forwarding | yes | yes (now btag-aware §11.4.3) |
+| Branch-tag gating | — | **yes (§11.4)** |
+| Drain to L1-D | OoO upon resolve | only when btag = `0xFF` |
+
+### 12.3 TLBs (v1 §11.2, 未变更)
+
+| TLB | Entries | Associativity | Page sizes | Miss penalty |
+|-----|---------|---------------|------------|-------------|
+| I-TLB | **64** | Fully assoc | 4 KB, 2 MB | L2 TLB lookup |
+| D-TLB | **64** | Fully assoc | 4 KB, 2 MB | L2 TLB lookup |
+| L2 TLB (unified) | **512** | 8-way | 4 KB, 2 MB, 1 GB | Page table walk |
+
+### 12.4 MTE Memory Path (v1 §11.4, 未变更)
+
+The MTE unit has a **high-bandwidth path** to the L2 cache (and external memory) for tile data transfers, separate from the scalar LSU path through L1-D.
+
+```
+  MTE ──▶ L2 Cache (512 KB) ──▶ External Memory
+           64 B/cy sustained bandwidth
+           1 cache line per cycle
+           1 tile (4 KB) = 64 cache lines = 64 cycles from L2
+```
+
+| Parameter | Value |
+|-----------|-------|
+| MTE → L2 bandwidth | **64 B/cycle** (1 cache line/cycle) |
+| Tile load from L2 (hit) | **64 cycles** per tile (4 KB / 64 B) |
+| Tile load from external memory | **200–400 cycles** per tile (DRAM dependent) |
+| Outstanding MTE requests | **32** (deep buffer for memory-level parallelism) |
+| Prefetch support | MTE RS can issue TILE.LD early, buffering data in TRegFile |
+
+The MTE unit exploits the large TRegFile-4K (256 tiles, 1 MB) as a **software-managed scratchpad**. Programmers (or compiler) schedule TILE.LD instructions well ahead of CUBE.OPA to hide memory latency. The 32-entry outstanding request buffer allows many tile loads to be in flight simultaneously, maximizing bandwidth utilization.
+
+**v2 增量:** `TILE.ST` and `TILE.SCATTER` traffic on this path is gated by the 8-entry STQ (§11.5).
+
+### 12.5 Memory Ordering (v1 §11.5, 未变更; v2 增加 SSB 备注)
 
 Within a single thread:
-- Scalar loads / stores maintain program order via SSB FIFO drain + load-queue snooping (same as v1).
-- TILE.LD / TILE.ST are unordered with respect to each other unless serialized by FENCE.
-- Cross-domain ordering (e.g., scalar ST → TILE.LD reading the same location) is software-managed via FENCE.
 
-The SSB's branch-tag gating is **orthogonal** to memory ordering: stores still drain in alloc-age order, just only when their branch tag is non-speculative.
+- **Scalar loads and stores** maintain **program order** through the LSU's address disambiguation (store-to-load forwarding, load queue snooping). In v2 the forwarding source is the SSB (24 entries) instead of v1's 16-entry store buffer; semantics identical.
+- **TILE.LD/ST** operations are **unordered** with respect to each other by default. Software uses `FENCE` instructions when ordering between tile operations and scalar operations is required.
+- **CUBE.OPA** reads from TRegFile-4K are ordered with respect to preceding TILE.LD operations by the **Tile RAT ready bits** (the cube RS will not issue until the source physical tiles are marked "ready" by completed TILE.LD operations).
+
+The SSB's branch-tag gating is **orthogonal** to memory ordering: stores still drain in alloc-age order, just only when their branch tag is non-speculative (§11.4.2).
 
 ---
 
 ## 13. Mixed-Domain Instruction Scheduling
 
-**Largely unchanged from v1 §12.** All four domains share the same front-end, dispatch to domain-specific RSs, and synchronize through Tile RAT ready bits / TCB / CDB.
+> **(v1 → v2: 子节 13.A / 13.B / 13.C / 13.D 完整复制自 v1 §12.1 / §12.2 / §12.3 / §12.4。v2 增量为 §13.1 / §13.2 / §13.3。)**
 
-### 13.1 New scheduling considerations under speculation
+All four domains share the same front-end, dispatch to domain-specific RSs, and synchronize through Tile RAT ready bits / TCB / CDB.
+
+### 13.A Unified Front-End, Distributed Back-End (v1 §12.1, 未变更)
+
+All four instruction domains share the same front-end pipeline (fetch, decode, rename). At dispatch, instructions are routed to domain-specific reservation stations. This allows the core to exploit instruction-level parallelism across domains:
+
+```
+  Single instruction stream (architectural tile regs T0–T31):
+    ADD   X5, X2, X3        → Scalar RS → ALU
+    TILE.LD T10, [X5]       → Tile RAT: T10→PT200;  MTE RS (ptdst=PT200, depends on X5 via CDB)
+    TILE.LD T20, [X6]       → Tile RAT: T20→PT201;  MTE RS (ptdst=PT201, independent)
+    VADD  T30, T10, T20     → Tile RAT: T30→PT202;  Vector RS (ptsrc=PT200,PT201; depends via TCB)
+    CUBE.OPA z0, T10, T20, r1  → Cube RS (ptsrc=PT200,PT201; depends via TCB ready bits)
+    TILE.GET X7, T30, X8    → MTE RS (ptsrc=PT202, depends via TCB; pdst=P60 → CDB scalar result)
+    TILE.PUT T10, X9, X10   → Tile RAT: T10→PT203; MTE RS (ptsrc=PT200_old, ptdst=PT203; RMW)
+    ADD   X11, X7, X9       → Scalar RS → ALU (depends on X7 via CDB from TILE.GET)
+```
+
+### 13.B Cross-Domain Dependencies (v1 §12.2, 未变更; v2 增加投机条目见 §13.3)
+
+Dependencies between domains are tracked through shared mechanisms:
+
+| Dependency | Mechanism |
+|------------|-----------|
+| **Scalar → MTE** (address operands) | MTE RS entry holds scalar P-reg tag for base address; wakeup via CDB when scalar ALU produces address |
+| **Scalar → Vector** (scalar operand in vector reduction) | Vector RS entry holds scalar P-reg tag for scalar inputs; wakeup via CDB |
+| **MTE → Vector** (tile data readiness) | Tile RAT: TILE.LD completes → sets ready bit for physical tile; Vector RS wakes via TCB |
+| **MTE → Cube** (tile data readiness) | Tile RAT: TILE.LD completes → sets ready bit for physical tile; Cube RS wakes via TCB |
+| **Vector → Cube/MTE** (vector result tile) | Tile RAT: vector write completes → sets ready bit; downstream RS entries wake via TCB |
+| **Cube → MTE** (drain result tile) | Tile RAT: CUBE.DRAIN completes → sets ready bit for physical tile; MTE RS wakes via TCB |
+| **Tile → Scalar** (TILE.GET element extract) | TILE.GET reads physical tile, extracts element, broadcasts scalar result on CDB |
+| **Scalar → Tile** (TILE.PUT element insert) | TILE.PUT reads scalar GPR via CDB wakeup, reads old physical tile, writes new physical tile; TCB broadcast |
+| **Vector → Vector** (reduction result) | VEC reduction ops produce column/row-vector tile result (TCB completion) |
+
+### 13.C Tile RAT Wakeup & Tile Completion Bus (TCB) — (v1 §12.3, 未变更)
+
+The Tile RAT maintains a **ready bit** per physical tile register (256 bits total). This replaces a scoreboard: rename ensures every tile destination gets a unique physical tile, so there are no WAW/WAR hazards. The ready bit simply tracks whether the producing operation has finished writing the physical tile.
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  Tile RAT Ready Bits + Tile Completion Bus (TCB)                │
+  │                                                                 │
+  │  Tile RAT: 32 entries (arch T0–T31) → phys PT0–PT255           │
+  │  Ready array: 256 bits (one per physical tile)                  │
+  │  TCB: 4 broadcast ports (8-bit tag each, no data payload)      │
+  │                                                                 │
+  │  TILE.LD T10 renamed:    Tile RAT T10→PT200; ready[PT200] ← 0 │
+  │  TILE.LD PT200 completed: ready[PT200] ← 1; TCB broadcast PT200│
+  │                                                                 │
+  │  VADD T30,T10,T20 renamed: T30→PT202, reads PT200,PT201       │
+  │    RS entry: ptsrc1=PT200, ptsrc2=PT201, ptdst=PT202           │
+  │    TCB snoop: waits for ready[PT200] && ready[PT201]           │
+  │  VADD PT202 completed:   ready[PT202] ← 1; TCB broadcast PT202│
+  │                                                                 │
+  │  CUBE.OPA reads T10→PT200: checks ready[PT200]                │
+  │    if 0 → stall in Cube RS (waits for TCB wakeup)              │
+  │    if 1 → issue                                                 │
+  │                                                                 │
+  │  CUBE.DRAIN writes T12→PT205: ready[PT205] ← 0 at rename      │
+  │  CUBE.DRAIN completed:  ready[PT205] ← 1; TCB broadcast PT205 │
+  │                                                                 │
+  │  TILE.ST reads T12→PT205: checks ready[PT205]                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  TCB wakeup logic (per tile-domain RS entry):
+    For each RS entry with N tile sources (up to 3 in v2):
+      if (ptsrc_k == TCB_tag && !trdy_k):  trdy_k ← 1
+    Ready to issue when all trdy bits set (and scalar rdy if applicable)
+```
+
+### 13.D Concurrent Execution Example (v1 §12.4, 未变更)
+
+A typical transformer inference kernel mixes all four domains:
+
+```
+  Cycle  │ Scalar ALU │ LSU        │ Vector            │ MTE             │ Cube MXU
+  ───────┼────────────┼────────────┼───────────────────┼─────────────────┼──────────────
+  0–7    │ addr calc  │ scalar LD  │ —                 │ TILE.LD T0-T3   │ —
+  8–15   │ loop ctrl  │ scalar LD  │ —                 │ TILE.LD T4-T7   │ —
+  16–23  │ addr calc  │ —          │ VADD read epoch   │ TILE.LD T8-T11  │ CUBE.OPA z0,...
+  24–31  │ addr calc  │ —          │ VADD write epoch  │ TILE.LD T12-T15 │ (OPA continues)
+  32–47  │ addr calc  │ scalar ST  │ VMUL (16cy)       │ TILE.LD (next)  │ (OPA continues)
+  48–63  │ loop ctrl  │ —          │ VCVT (16cy)       │ TILE.ST T16     │ CUBE.DRAIN z0
+  64+    │ next iter  │ —          │ —                 │ TILE.LD (next)  │ CUBE.OPA z1,...
+```
+
+Key observations:
+- Scalar ALU computes addresses and loop control concurrently with cube execution.
+- MTE loads next tiles while cube processes current tiles (double-buffering at software level).
+- Vector unit handles element-wise operations (activation functions, normalization) in parallel.
+- All domains proceed independently, limited only by true data dependencies.
+
+---
+
+### 13.1 New scheduling considerations under speculation (v2 增量)
 
 | Scenario | v1 behaviour | v2 behaviour |
 |----------|--------------|--------------|
@@ -1352,7 +2570,38 @@ Vector unit area actually shrinks vs. v1's vector unit when accounting for [`vec
 
 ## 16. External Interfaces
 
-**Unchanged from v1 §15.** Core-to-NoC AXI4 interface, optional MOESI coherence, debug/trace remain identical.
+> **(v1 → v2: 内容未变更,以下完整复制自 v1 §15。)**
+
+### 16.1 Core-to-NoC Interface (v1 §15.1)
+
+| Parameter | Value |
+|-----------|-------|
+| Bus width | **256 bits** (32 B) |
+| Protocol | AXI4 (or similar point-to-point) |
+| Outstanding requests | **32** (read) + **16** (write) |
+| Burst length | Up to 4 beats (128 B, 2 cache lines) |
+| Clock domain | Core clock (synchronous) or async bridge |
+
+### 16.2 Cache Coherence (v1 §15.2)
+
+The Davinci core is designed primarily for single-core or non-coherent multi-core configurations (AI accelerator context). When coherence is needed:
+
+| Parameter | Value |
+|-----------|-------|
+| Protocol | MOESI or directory-based |
+| Snoop filter | L2 tag duplicate |
+| Coherence granularity | 64 B (cache line) |
+
+For tile data (TRegFile-4K), coherence is managed at the software level. Tile data bypasses the coherence protocol, flowing through the MTE's dedicated memory path.
+
+### 16.3 Debug & Trace Interface (v1 §15.3)
+
+| Feature | Description |
+|---------|-------------|
+| Debug halt | External debug request halts core at next instruction boundary |
+| PC trace | Compressed branch trace (taken/not-taken stream) |
+| Performance counters | 8 programmable counters: IPC, branch mispredict rate, cache miss rate, cube utilization, MTE stalls, RS occupancy |
+| Breakpoint registers | 4 instruction address breakpoints + 2 data address watchpoints |
 
 ---
 
@@ -1406,4 +2655,5 @@ Vector unit area actually shrinks vs. v1's vector unit when accounting for [`vec
 
 | Version | Date | Notes |
 |---------|------|-------|
+| **v2.1** | 2026-04-30 | **Native 3-source ternary FMA family (`VFMA`, `VFNMA`, `VLERP`) added — see §2.2.6a.** Operand `C` is promoted to a **dual role** (mask **or** value tile) selected by a new 1-bit issue-time `c_role ∈ {MASK, VALUE}` flag in the instruction word's `funct6` field (§2.2.2, §2.2.3). With `c_role = VALUE`, `C` is fetched as a full 4 KB value tile through a **3rd VEC-side TRegFile read port (R1)** — TRegFile-4K has 8 read ports, so this is purely a binding allocation, no new SRAM or bank-conflict pressure. With three value tiles fetched in parallel within one 8 cy epoch, `VFMA` runs at the **same throughput as a binary `VADD` / `VMUL` (1 tile / 8 cy)** — a 2× speed-up over the emulated `VMUL` + `VADD` two-instruction sequence — and produces the IEEE-754 single-rounding FMA result, halving the rounding error vs. emulation (critical for FP16 / BF16 / FP8 narrow-format normalisation kernels). **Justification (from [`FMA指令场景说明.md`](FMA指令场景说明.md))**: the canonical `y = γ·x̂ + β` LayerNorm / RMSNorm affine, Welford incremental update (`μ_new = δ·inv_n + μ_old`, `M2_new = δ·δ_2 + M2_old`), Welford state merge, activation polynomials (`gelu`, `swiglu`), and trigonometric polynomials (`sin`, `cos`) all need a third operand that is **not** the previous accumulator — v2.0's `VFMA_ACC D = A·B + Acc` does not apply. **Hardware delta vs. v2.0**: ~6 K gate (~0.2 % of VEC-4K-v2 area) — ~5 K for adding a 512 B/cy value-mode read path on `SC` alongside the existing 1-bit-mask path, ~1 K for control-path widening (Tile RAT / RS / dispatch carry the `c_role` bit). The stage-(B) per-lane FMA core, microcode beat machinery, and 8-port TRegFile already supported `A·B + Z` and the 3rd binding allocation. RS entry width unchanged in concept (the `c_role` bit slots into the existing flags). **Pipeline timing**: §8.3.7 latency table updated with `VFMA / VFNMA` rows (16 cy total = 8 fetch + 8 retire, 1/8 throughput) and `VLERP` (24 cy total, 1/16 throughput due to dual retire); mixed-`is_transpose` rows added (16 cy fetch for one-mismatched, 24 cy for all-distinct degenerate). **Documentation updates**: §2.2.2 operand model gains the `c_role` row + 3rd-port rationale callout; §2.2.3 encoding diagram shows the new `c_role` bit; **new §2.2.6a with full ISA semantics, kernel motivation, hardware-cost breakdown, and pipeline-timing table**; §2.2.8 instruction list gains **Category O — Native 3-source Ternary FMA family**; §8.3.7 latency table updated. **Backward compatibility preserved**: v1 / v2.0 binaries emit `c_role = MASK` exclusively, `R1` stays idle and clock-gated, no behaviour change. Companion update in [`vector4k_v2.md`](vector4k_v2.md) v0.18 (§3.1, §3.3c, §6.2, §7.6, §10). |
 | **v2.0** | 2026-04-30 | **Initial Davinci-v2 specification.** Three major changes vs. v1: **(1) TRegFile-4K with per-port `is_transpose` flag** ([`tregfile4k.md`](tregfile4k.md) §7), enabling row-mode or col-mode delivery at full 512 B/cy; consumed by v2 vector unit and (optionally) by cube and MTE. **(2) Vector unit re-architected to VEC-4K-v2** ([`vector4k_v2.md`](vector4k_v2.md)): explicit SRAM-based staging registers (`SA`, `SB`, `SC`) decoupling TRegFile fetch from compute, per-beat microcode dispatch, 3-source / 2-dest tile operands with per-element bitmask predication, restored FP4 and FP8 formats, three new PTO instructions (`TINV` matrix inverse up to 128×128 FP32, `TROWRANGE_MUL` row-range product, `TMRGSORT` bitonic sort over any `N = 2^p` up to 8192), and **tile-register metadata** (32 b: `shape.x`, `shape.y`, `format`) carried via a new Tile Metadata RAT. **(3) Branch-prediction-driven speculative execution** with a ROB-less recovery scheme (§11): a 5-K-gate Branch-Tag Speculation Tracker (8 tags + 8×8 ancestry bitmap), a 24-entry **Speculative Store Buffer** (SSB) that gates scalar stores by branch tag, and an 8-entry **Speculative Tile-Store Queue** (STQ) that gates MTE bulk stores by branch tag. The scheme proves that all three classes of speculative state (renamed registers/tiles, in-flight pipeline state, externally-visible memory effects) can be safely recovered without a Reorder Buffer: classes A and B reuse the v1 RAT-checkpoint + refcount + branch-tag-CAM machinery; class C is gated by SSB / STQ until the producing branch tag becomes non-speculative. Mispredict penalty: 6–7 cy (vs. v1's 6 cy). Total v2 speculation hardware: ~110 K gate (~0.025 mm²), about 3.5% of the v1 core area. v2 core area: ~3.41 mm², a ~5% increase over v1's ~3.26 mm². Performance gains: 1.3–1.4× on masked-vector kernels (softmax, layer norm, masked attention), ~100× on `TINV`-bound (Kalman, NeRF pose) and `TMRGSORT`-bound (top-k, beam-search) kernels, and ~2–3× sustained scalar IPC improvement on speculative-heavy code paths. Cube unit, scalar unit, memory subsystem (caches), and external interfaces remain unchanged from v1. |
