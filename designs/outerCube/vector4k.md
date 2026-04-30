@@ -17,23 +17,19 @@ Each logical tile occupies exactly **4096 bytes** in the TRegFile. The logical s
 - **R** and **C** are powers of two (implementation may also require R·C to match the element count implied by the format).
 - **Row-major** layout: address increases along columns within a row, then along rows.
 
-Let **E** be the **storage bytes per logical element** in the chosen encoding:
+Let **E** be the **storage bytes per logical element** in the chosen encoding. **Only two storage widths are supported** — FP32 and FP16 / BF16. Smaller-precision formats (FP8, MXFP4, HiFP4) are explicitly **out of scope**:
 
-| Logical format | Typical storage `E` (bytes / element) | Elements per 4 KB tile (N = 4096 / E) |
-|----------------|----------------------------------------|----------------------------------------|
-| FP32           | 4                                      | 1024                                   |
-| FP16 / BF16    | 2                                      | 2048                                   |
-| FP8 (E4M3/E5M2)| 1                                      | 4096                                   |
-| MXFP4 / HiFP4  | ½ (packed nibble pair in byte)       | 8192                                   |
+| Logical format | Storage `E` (bytes / element) | Elements per 4 KB tile (N = 4096 / E) |
+|----------------|-------------------------------|----------------------------------------|
+| FP32           | 4                             | 1024                                   |
+| FP16 / BF16    | 2                             | 2048                                   |
 
-For **sub-byte** types, hardware views memory as **byte lanes**; unpack/pack stages map nibbles to wider internal operands (e.g. FP16/FP32) for ALU operations, then pack back on write.
+Internal ALU / reducer operands are widened to FP32 where required by ISA numerics (e.g. associative-reduce accumulation); pack / unpack is narrow-to-narrow only (FP16 ↔ FP32 cast per `TCVT`). There are **no packed-nibble lanes** anywhere in the datapath.
 
 **Valid shape examples** (illustrative):
 
 - FP32: 32×32, 16×64, 64×16, … (R·C = 1024).
-- FP16: 64×32, 32×64, 128×16, … (R·C = 2048).
-- FP8: 64×64, 128×32, … (R·C = 4096).
-- FP4: 128×64, 256×32, … (R·C = 8192).
+- FP16 / BF16: 64×32, 32×64, 128×16, … (R·C = 2048).
 
 ### 2.2 Metadata
 
@@ -57,7 +53,7 @@ Ports may target **independent tile bases** (e.g. `src0` and `src1`) or **the sa
 
 When VEC is attached to [`tregfile4k.md`](tregfile4k.md), a concrete dual-read binding is **Rd0 → R0** (**Port A**, phase **0**) and **Rd1 → R4** (**Port B**, phase **4**) so **same `tile_idx`** yields strip pair **`(G,e)`** and **`(G+4,e)`** at epoch phase **e** (**§4.4**).
 
-**Read semantics:** TRegFile read ports present **only** full **512 B** bank-group strips per [`tregfile4k.md`](tregfile4k.md) — **no gather** (no sub-strip element indexing inside the RF). **`TCOL*`** therefore **replays** the same `reg_idx` over **multiple cycles** / **epochs** as needed; **column extraction** is done in **VEC** from **strip buffers A/B** after each read (**§5.3.2**, **§4.4 Example H**).
+**Read semantics:** TRegFile read ports present **only** full **512 B** bank-group strips per [`tregfile4k.md`](tregfile4k.md) — **no gather** (no sub-strip element indexing inside the RF). **`TCOL*`** therefore **replays** the same `reg_idx` over **multiple cycles** / **epochs** as needed; **column extraction** is done in **VEC** from **strip buffers A/B** after each read (**§5.3.2**, **§4.4 Example E**).
 
 ### 3.2 Physical Strip
 
@@ -140,7 +136,7 @@ The micro-architecture below assumes **8 strip indices** per 4 KB tile and sched
                                 │ mux: one 256-word half
                                 ▼
               ┌─────────────────────────────────────┐
-              │  Pack (wide → FP8/FP4 / narrow dst)   │
+              │  Pack (FP32 → FP16 / BF16 cast, per TCVT) │
               └─────────────────┬───────────────────┘
                                 │
                     ┌───────────▼───────────┐
@@ -175,7 +171,7 @@ The micro-architecture below assumes **8 strip indices** per 4 KB tile and sched
 
 **Strip read calendar:** A **calendar** is the **cycle-by-cycle** schedule that binds **what arrives on Rd0/Rd1** to **what the datapath does**—in particular, **which operands feed each lane** and **which `fiber_id`(s)** touch **Acc** or **per-fiber `v` buffers** that cycle.
 
-- **Port row (per cycle `t`):** specifies **`s(t)`** (which **512 B** chunk), **which logical tile** each port reads (**`src0`**, **`src1`**, narrow **`v`** tile, scalar tile, **ping-pong scratch** for merges/sorts, or **idle**), and optional **second-pass** phases. **`TCOL*`** does **not** use a **transpose scratchpad** — only **normal** `reg_idx` tiles in **row-major** strip order (**§5.3.2**). TRegFile ports **cannot gather** (**§3.1**); **`TCOL*`** may **repeat** the **same** `reg_idx` over **multiple TRegFile epochs** when **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉) > 1`** (**§5.3.2**, **§4.4 Example H**; **`#W`** **reduces** to **two** **terms** **when** **`N_acc ≤ N_run`**).
+- **Port row (per cycle `t`):** specifies **`s(t)`** (which **512 B** chunk), **which logical tile** each port reads (**`src0`**, **`src1`**, narrow **`v`** tile, scalar tile, **ping-pong scratch** for merges/sorts, or **idle**), and optional **second-pass** phases. **`TCOL*`** does **not** use a **transpose scratchpad** — only **normal** `reg_idx` tiles in **row-major** strip order (**§5.3.2**). TRegFile ports **cannot gather** (**§3.1**); **`TCOL*`** may **repeat** the **same** `reg_idx` over **multiple TRegFile epochs** when **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉) > 1`** (**§5.3.2**, **§4.4 Example E**; **`#W`** **reduces** to **two** **terms** **when** **`N_acc ≤ N_run`**).
 - **Operand sources (`TROW*` reduce):** **Tile elements** arrive strip-serially from **read ports**; after **unpack → within-strip tree → cross-strip combine**, the reducer performs **RMW** on **Acc** at **`fiber_id = r`**. Physical slot **`ρ`** is **`fiber_id` remapped** into **`[0, N_run)`** for the current **Acc wave** (§9.3.2: **`bank = ρ mod 8`**, **`word = ρ >> 3`**, **0…63**). One strip can touch **many** distinct **`fiber_id`**s when **`row_B < 512`** or **`col_B < 512`** (many thin fibers per strip).
 - **Operand sources (`TCOL*` reduce):** Ports still deliver **full rows** inside each **512 B** strip; **VEC** **selects** **`(r,c)`** for the scheduled **column band** from **strip buffers** (**no RF gather**). **Acc[`c`]** **+=** partial sums across strip-beats and, if needed, across **re-scans** of the tile.
 - **Operand sources (expand):** **`v[fiber_id]`** is supplied from a **narrow per-fiber vector** streamed on a read port, from **Acc / staging** after an in-place reduce, or from a **small buffer** filled in a **prefetch** phase; **`src`** elements still arrive **strip-major** like §5.1. The calendar interleaves **`v`** strip reads with **`src`** strips so each cycle’s SIMD sees a consistent **`(fiber_id, lane)`** map.
@@ -195,7 +191,7 @@ The micro-architecture below assumes **8 strip indices** per 4 KB tile and sched
 
 ### 4.4 Epoch-aligned fiber calendars vs `tregfile4k.md` (four worked examples)
 
-Full **(format, shape)** enumeration would need **76** row-axis templates alone (§9); this subsection fixes **VEC ↔ TRegFile-4K** timing and shows **eight** representative **`fiber_id`** calendars (**Examples A–H**; **E–H** emphasize **FP8** and **MXFP4**). See [`tregfile4k.md`](tregfile4k.md): global **`e = cy[2:0]`** (phase within an **8-cycle** epoch); read port **Rp** presents bank-group **`G = (p + e) mod 8`** (**512 B** = one **strip** **Gs**).
+Full **(format, shape)** enumeration would need **35** row-axis templates alone (§9); this subsection fixes **VEC ↔ TRegFile-4K** timing and shows **five** representative **`fiber_id`** calendars (**Examples A–E**; FP32 and FP16 / BF16 only). See [`tregfile4k.md`](tregfile4k.md): global **`e = cy[2:0]`** (phase within an **8-cycle** epoch); read port **Rp** presents bank-group **`G = (p + e) mod 8`** (**512 B** = one **strip** **Gs**).
 
 **Port binding for the tables:**
 
@@ -219,7 +215,7 @@ Full **(format, shape)** enumeration would need **76** row-axis templates alone 
 | **Fibers (this beat)** | **`fiber_id`** values whose **row data** (reduce) or **row op** (expand) is anchored on **that port’s** strip in this cycle. |
 | **First elem @ port** | Logical **element** at **byte 0** of that port’s 512 B chunk for the listed fiber (start of the row segment in that strip). |
 | **`#elem`** | **Logical elements along the row** (along **C**) taken from **that port** this cycle toward **`TROW*`** / expand **`src`**. |
-| **Reduce / expand** | **`TROWSUM`:** cross-lane tree over **`#elem`** → **one** partial per **`fiber_id = r`** → **Acc RMW**. **`TCOL*`** (**§5.3.2**): **`fiber_id = c`**; **strip replay** + **VEC column mux** + **`Acc[c]`** **RMW**; **`P_beat = min(N_tree, N_acc)`**; **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`** (**`f`**, **`N_run`**, **§5.3.2**; **`#W`** ≡ **`#waves`** **when** **`⌈C/N_run⌉ ≤ ⌈C/N_acc⌉`**) — **§4.4 Example H**. **`TROWEXPANDADD`:** for each **`fiber_id`**, combine **`#elem`** **`src`** lanes with **`v[fiber_id]`** (from **`v`** tile or latch). |
+| **Reduce / expand** | **`TROWSUM`:** cross-lane tree over **`#elem`** → **one** partial per **`fiber_id = r`** → **Acc RMW**. **`TCOL*`** (**§5.3.2**): **`fiber_id = c`**; **strip replay** + **VEC column mux** + **`Acc[c]`** **RMW**; **`P_beat = min(N_tree, N_acc)`**; **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`** (**`f`**, **`N_run`**, **§5.3.2**; **`#W`** ≡ **`#waves`** **when** **`⌈C/N_run⌉ ≤ ⌈C/N_acc⌉`**) — **§4.4 Example E**. **`TROWEXPANDADD`:** for each **`fiber_id`**, combine **`#elem`** **`src`** lanes with **`v[fiber_id]`** (from **`v`** tile or latch). |
 
 *End-to-end latency* may add **tree pipeline stages** after the last ingest cycle; tables list **operand arrival** and **per-fiber arithmetic scope** per cycle.
 
@@ -276,67 +272,26 @@ Full **(format, shape)** enumeration would need **76** row-axis templates alone 
 
 ---
 
-#### Example D — `TROWSUM`, **HiFP4**, **256×32** (`C = 32`, **`E = ½`**, **32 rows / strip**)
+#### Example D — `TROWSUM`, **FP16**, **128×16** (`C = 16`, **`E = 2`**, **16 rows / strip**)
 
-**Geometry:** **`row_B = 16 B`** = **32** logical elements/row; **`512 / 16 = 32`** distinct **`fiber_id`** values per strip. **Dual-port** same **`src`**: **`t = 0…3`** covers **256** rows (all fibers) with **64** partial trees/cycle (32 fibers × 2 ports).
-
-| `t` | `e` | Port A | Port B | Fiber IDs (A) | First elem @ A | `#elem` | Fiber IDs (B) | First elem @ B | `#elem` | Reduce note |
-|----:|----:|--------|--------|---------------|----------------|--------:|---------------|----------------|--------:|-------------|
-| 0 | 0 | `src@G0` | `src@G4` | `r=0…31` | row `r` starts at byte **`16r`** mod strip | 32 each | `r=128…159` | byte **`16(r−128)`** in **G4** strip | 32 each | **64** lane-trees → **64** **Acc** RMW (**watch bank** = `r mod 8`) |
-| 1 | 1 | `src@G1` | `src@G5` | `32…63` | … | 32 | `160…191` | … | 32 | **64** **Acc** |
-| 2 | 2 | `src@G2` | `src@G6` | `64…95` | … | 32 | `192…223` | … | 32 | **64** **Acc** |
-| 3 | 3 | `src@G3` | `src@G7` | `96…127` | … | 32 | `224…255` | … | 32 | **64** **Acc** |
-
-**`t = 4…7`:** duplicate **`src`** strips (suppress **Acc** idempotent re-reduce) unless **`reg_idx`** advances to a **second** tile / phase.
-
----
-
-#### Example E — `TROWSUM`, **FP8** (`E = 1`), **64×64** (`C = 64`, **8 rows / strip**)
-
-**Geometry:** **`row_B = 64 B`** = **64** **`UINT8`/FP8** elements along the row; **`512 / 64 = 8`** distinct **`fiber_id`** values per strip. **Dual-port** same **`src`**: **`t = 0…3`** ingests all **64** rows (**16** partial trees/cycle).
+**Geometry:** **`row_B = 32 B`** = **16** FP16 elements/row; **`512 / 32 = 16`** distinct **`fiber_id`** values per strip. **Dual-port** same **`src`**: **`t = 0…3`** covers all **128** rows (**32** partial trees/cycle = 16 fibers × 2 ports). **`K = 16`**, **`D_lane = 4`**.
 
 | `t` | `e` | Port A | Port B | Fiber IDs (A) | First elem @ A | `#elem` | Fiber IDs (B) | First elem @ B | `#elem` | Reduce note |
 |----:|----:|--------|--------|---------------|----------------|--------:|---------------|----------------|--------:|-------------|
-| 0 | 0 | `src@G0` | `src@G4` | `r=0…7` | row `r` at byte **`64r`** in **G0** | 64 | `r=32…39` | byte **`64(r−32)`** in **G4** *(base row **32**)* | 64 | **16** lane-trees → **Acc** (unpack **FP8→FP32** internal) |
-| 1 | 1 | `src@G1` | `src@G5` | `8…15` | … | 64 | `40…47` | … | 64 | **16** **Acc** |
-| 2 | 2 | `src@G2` | `src@G6` | `16…23` | … | 64 | `48…55` | … | 64 | **16** **Acc** |
-| 3 | 3 | `src@G3` | `src@G7` | `24…31` | … | 64 | `56…63` | … | 64 | **16** **Acc** |
+| 0 | 0 | `src@G0` | `src@G4` | `r=0…15` | row `r` at byte **`32r`** in **G0** | 16 | `r=64…79` | byte **`32(r−64)`** in **G4** | 16 | **32** lane-trees → **32** **Acc** RMW (**watch bank** = `r mod 8`) |
+| 1 | 1 | `src@G1` | `src@G5` | `16…31` | … | 16 | `80…95` | … | 16 | **32** **Acc** |
+| 2 | 2 | `src@G2` | `src@G6` | `32…47` | … | 16 | `96…111` | … | 16 | **32** **Acc** |
+| 3 | 3 | `src@G3` | `src@G7` | `48…63` | … | 16 | `112…127` | … | 16 | **32** **Acc** |
+
+**`t = 4…7`:** duplicate **`src`** strips (suppress **Acc** idempotent re-reduce) unless **`reg_idx`** advances. **BF16 128×16** reuses **exactly the same calendar** (same `E`, same byte layout, different payload semantics).
 
 ---
 
-#### Example F — `TROWSUM`, **FP8** (`E = 1`), **16×256** (`C = 256`, **2 rows / strip**)
-
-**Geometry:** **`row_B = 256 B`**; **`512 / 256 = 2`** rows per strip. **Dual-port** same **`src`**: **4** cycles × **4** fibers/cycle = **16** rows.
-
-| `t` | `e` | Port A | Port B | Fibers (A) | First elem @ A | `#elem` | Fibers (B) | First elem @ B | `#elem` | Reduce note |
-|----:|----:|--------|--------|------------|----------------|--------:|-----------|----------------|--------:|-------------|
-| 0 | 0 | `src@G0` | `src@G4` | `r=0`, `1` | `(0,0)`, `(1,0)` | 256 each | `r=8`, `9` | strip **G4** row **8** at byte **0**, row **9** at byte **256** | 256 | **4** trees (`K=256`, **`D_lane = 8`**) |
-| 1 | 1 | `src@G1` | `src@G5` | `2`, `3` | … | 256 | `10`, `11` | … | 256 | **4** **Acc** |
-| 2 | 2 | `src@G2` | `src@G6` | `4`, `5` | … | 256 | `12`, `13` | … | 256 | **4** **Acc** |
-| 3 | 3 | `src@G3` | `src@G7` | `6`, `7` | … | 256 | `14`, `15` | … | 256 | **4** **Acc** |
-
-*(Row **8** in **G4:** byte offset **`512·4 = 2048`** = **`8 × 256`**.)*
-
----
-
-#### Example G — `TROWSUM`, **MXFP4** (`E = ½`, packed nibble), **512×16** (`C = 16`, **64 rows / strip**)
-
-**Geometry:** **`row_B = 8 B`** = **16** logical FP4 elements/row; **`512 / 8 = 64`** **`fiber_id`**s per strip. **Dual-port** same **`src`**: **`t = 0…3`** covers **512** rows (**128** lane-trees/cycle). **Unpack** maps **nibble lanes** to **wide** compare/add operands before **Acc**.
-
-| `t` | `e` | Port A | Port B | Fiber IDs (A) | First elem @ A | `#elem` | Fiber IDs (B) | First elem @ B | `#elem` | Reduce note |
-|----:|----:|--------|--------|---------------|----------------|--------:|---------------|----------------|--------:|-------------|
-| 0 | 0 | `src@G0` | `src@G4` | `r=0…63` | row `r` at byte **`8r`** in **G0** | 16 | `r=256…319` | byte **`8(r−256)`** in **G4** | 16 | **128** trees → **128** **Acc** RMW |
-| 1 | 1 | `src@G1` | `src@G5` | `64…127` | … | 16 | `320…383` | … | 16 | **128** **Acc** |
-| 2 | 2 | `src@G2` | `src@G6` | `128…191` | … | 16 | `384…447` | … | 16 | **128** **Acc** |
-| 3 | 3 | `src@G3` | `src@G7` | `192…255` | … | 16 | `448…511` | … | 16 | **128** **Acc** |
-
----
-
-#### Example H — `TCOLSUM`, **MXFP4** (`E = ½`), **32×256** (`R = 32`, **`C = 256`**, **native row-major**)
+#### Example E — `TCOLSUM`, **FP16**, **16×128** (`R = 16`, **`C = 128`**, **native row-major**)
 
 **TRegFile:** Read ports emit **only** full **512 B** strips (**[`tregfile4k.md`](tregfile4k.md)**); **there is no gather** inside the tile RF. **`TCOLSUM`** cannot request “column **`c`** only” from the file — it must **accept whole strips** on **Port A / Port B**, then **select** the needed **`(r,c)`** in **VEC** (strip buffers → unpack → **column mux** / shifter network).
 
-**Policy:** **No transpose scratchpad** (**§5.3.2**). Operand remains **one** `reg_idx`, **§2.1** row-major. **Acc[`c`]**: **read–modify–write** associative **add** so partials from each strip-beat **accumulate** until all **R = 32** row contributions for column **`c`** are seen.
+**Policy:** **No transpose scratchpad** (**§5.3.2**). Operand remains **one** `reg_idx`, **§2.1** row-major. **Acc[`c`]**: **read–modify–write** associative **add** so partials from each strip-beat **accumulate** until all **R = 16** row contributions for column **`c`** are seen.
 
 **Hardware parallelism (§5.3.2):** Let **`N_tree`** = parallel **adder / reduce trees** per beat; **`N_acc`** = parallel **Acc** **RMW** slots per cycle (**`N_acc ≤ N_run`**, **§9.3.2**); **`f`** = **effective `Acc[c]` commits per tree per full tile scan** (one **dual-ingest** pass over **all** strips — includes **sub-cycles** / **pipeline**). **Same-cycle** combine+retire is capped by **`P_beat = min(N_tree, N_acc)`**.
 
@@ -348,39 +303,37 @@ Full **(format, shape)** enumeration would need **76** row-axis templates alone 
 - **`#waves_tree = ⌈C / (N_tree · f)⌉`**: when **`N_tree ≪ N_acc`**, **tree throughput** may require **more** **full scans** than **`#waves_acc`** predicts.  
 - **`#waves_Nrun = ⌈C / N_run⌉`**: **DFF** **capacity** (**§5.3.2**); **redundant** **vs** **`#waves_acc`** **when** **`N_acc ≤ N_run`**.
 
-When **`N_acc > N_tree`**, **trees** are **time-multiplexed** over **sub-cycles**; **`f`** must be **measured** from **RTL**/**micro-arch** (Example: **`S = 4`** strip-pair beats × **`f_micro`** commits per beat per tree).
+When **`N_acc > N_tree`**, **trees** are **time-multiplexed** over **sub-cycles**; **`f`** must be **measured** from **RTL**/**micro-arch**.
 
-**Illustrative numbers:** **`C = 256`**, **`N_acc = 64`**, **`N_run = 512`** → **`#waves_acc = 4`**, **`⌈C/N_run⌉ = 1`**. With **`N_tree = 8`**, **`f = 8`** (e.g. **8** **`Acc[c]`** commits per tree over one **4-beat** scan × **2** **micro** rounds): **`N_tree · f = 64`**, **`#waves_tree = 4`**, **`#W = max(4, 4, 1) = 4`**. With **`N_tree = 4`**, **`f = 8`**: **`N_tree · f = 32`**, **`#waves_tree = 8`**, **`#W = max(4, 8, 1) = 8`** — **tree**-limited; **strip calendar** is unchanged, but **microcode** runs **more** **tile** **epochs** and may **shrink** the **column band** per wave below **`N_acc`**.
+**Illustrative numbers:** **`C = 128`**, **`N_acc = 64`**, **`N_run = 512`** → **`#waves_acc = 2`**, **`⌈C/N_run⌉ = 1`**. With **`N_tree = 8`**, **`f = 8`**: **`N_tree · f = 64`**, **`#waves_tree = 2`**, **`#W = max(2, 2, 1) = 2`**. With **`N_tree = 4`**, **`f = 8`**: **`N_tree · f = 32`**, **`#waves_tree = 4`**, **`#W = max(2, 4, 1) = 4`** — **tree**-limited; **strip calendar** is unchanged, but **microcode** runs **more** **tile** **epochs** and may **shrink** the **column band** per wave below **`N_acc`**.
 
-**Acc-limited schedule (`#W = ⌈C / N_acc⌉`):** **`c_base = N_acc · k`** as in the tables below. **`N_tree = 32`**, **`N_acc = 64`** may still need **two** **tree** **phases** per **`t`** — **micro-cycles** expand **`f`**; re-check **`#waves_tree`**.
+**Acc-limited schedule (`#W = ⌈C / N_acc⌉ = 2`):** **`c_base = N_acc · k`** as in the tables below.
 
-**Geometry:** **`row_B = 128 B`** (**256** FP4 elements/row); **4** rows per **512 B** strip. **Dual** read (**R0+R4**, **§3.1**): **`t = 0…3`** (**`e = 0…3`**) delivers **unique** strip pairs **`(0,4)…(3,7)`** and visits **all 32** rows **once per full scan**. Cycles **`t = 4…7`** of the **same** TRegFile **epoch** repeat the **same** strips (second lap with identical `reg_idx`); **disable Acc updates** on **`t = 4…7`** unless **overlapped** with another **column band** (implementation choice).
+**Geometry:** **`row_B = 256 B`** (**128** FP16 elements/row); **2** rows per **512 B** strip. **Dual** read (**R0+R4**, **§3.1**): **`t = 0…3`** (**`e = 0…3`**) delivers **unique** strip pairs **`(0,4)…(3,7)`** and visits **all 16** rows **once per full scan**. Cycles **`t = 4…7`** of the **same** TRegFile **epoch** repeat the **same** strips (second lap with identical `reg_idx`); **disable Acc updates** on **`t = 4…7`** unless **overlapped** with another **column band** (implementation choice).
 
 **If `N_acc ≥ C`:** **one** wave (**one** scan, **`t = 0…3`**) suffices for all columns.
 
-**Per-strip-beat (one wave):** From **A**/**B** buffers, **column mux** pulls **`(r,c)`** for **`c`** in the active band only; **8** row samples per **`c`** per **`t`** (4 rows × 2 ports) → **`Acc[c] +=`** partial (after **`K = 8`** interim reduce via **`N_tree`** lanes). After **`t = 3`** for that wave, each **`c`** in the band has **32** row terms accumulated → **done** for **`TCOLSUM`** (modulo tree **pipeline**).
+**Per-strip-beat (one wave):** From **A**/**B** buffers, **column mux** pulls **`(r,c)`** for **`c`** in the active band only; **4** row samples per **`c`** per **`t`** (2 rows × 2 ports) → **`Acc[c] +=`** partial (after interim reduce via **`N_tree`** lanes). After **`t = 3`** for that wave, each **`c`** in the band has **16** row terms accumulated → **done** for **`TCOLSUM`** (modulo tree **pipeline**).
 
 **Strip calendar (identical each wave; `c_base = N_acc · k`):**
 
 | `t` | `e` | Port A | Port B | Rows in A / B | **`fiber_id` band** | Per-**`c`** row samples this `t` | **Acc** |
 |----:|----:|--------|--------|---------------|---------------------|----------------------------------|---------|
-| 0 | 0 | `src@G0` | `src@G4` | **0–3** / **16–19** | **`c ∈ [c_base, c_base + N_acc − 1]`** | **8** | **`Acc[c] +=`** partial from **8** **`(r,c)`** (mux from **A/B**) |
-| 1 | 1 | `src@G1` | `src@G5` | **4–7** / **20–23** | same band | **8** | **+=** … |
-| 2 | 2 | `src@G2` | `src@G6` | **8–11** / **24–27** | same band | **8** | **+=** … |
-| 3 | 3 | `src@G3` | `src@G7` | **12–15** / **28–31** | same band | **8** | **32** terms integrated per **`c`** in band |
+| 0 | 0 | `src@G0` | `src@G4` | **0–1** / **8–9**   | **`c ∈ [c_base, c_base + N_acc − 1]`** | **4** | **`Acc[c] +=`** partial from **4** **`(r,c)`** (mux from **A/B**) |
+| 1 | 1 | `src@G1` | `src@G5` | **2–3** / **10–11** | same band | **4** | **+=** … |
+| 2 | 2 | `src@G2` | `src@G6` | **4–5** / **12–13** | same band | **4** | **+=** … |
+| 3 | 3 | `src@G3` | `src@G7` | **6–7** / **14–15** | same band | **4** | **16** terms integrated per **`c`** in band |
 
-**`(r,c)` byte** in a strip with base row **`r₀`**: **`(r − r₀)·row_B + ⌊c·E⌋`** plus **nibble** select (**`E = ½`**). **Multi-epoch summary** (**Acc-limited** **`#W = 4`**, i.e. **`#waves_tree ≤ #waves_acc`**; **`N_acc = 64`**, **`N_run = 512`**):
+**`(r,c)` byte** in a strip with base row **`r₀`**: **`(r − r₀)·row_B + c·E`** with **`E = 2`** (FP16). **Multi-epoch summary** (**Acc-limited** **`#W = 2`**, i.e. **`#waves_tree ≤ #waves_acc`**; **`N_acc = 64`**, **`N_run = 512`**):
 
 | Wave `k` | Tile read policy | Active columns | Strip beats used |
 |----------|------------------|----------------|------------------|
-| 0 | Same `reg_idx`, epoch **E0** | **`c = 0…63`** | **`t = 0…3`** as above |
+| 0 | Same `reg_idx`, epoch **E0** | **`c = 0…63`**   | **`t = 0…3`** as above |
 | 1 | **Re-read** same tile, epoch **E1** | **`c = 64…127`** | repeat calendar |
-| 2 | epoch **E2** | **`c = 128…191`** | repeat |
-| 3 | epoch **E3** | **`c = 192…255`** | repeat |
 
-If **`#waves_tree > #waves_acc`**, add **waves** **`k = 4 … #W − 1`** with **overlapping** or **narrower** **column** **bands** — **implementation**-specific.
+If **`#waves_tree > #waves_acc`**, add **waves** **`k = 2 … #W − 1`** with **overlapping** or **narrower** **column** **bands** — **implementation**-specific.
 
-**Cycle lower bound (illustrative):** **`#W × 4`** strip-pair cycles (**`#W`** from **§5.3.2** **`max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`**), **plus** **epoch** turnarounds — **implementation-dependent**. **Single-port A only** doubles strip cycles per scan (**`t = 0…7`** unique).
+**Cycle lower bound (illustrative):** **`#W × 4`** strip-pair cycles (**`#W`** from **§5.3.2** **`max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`**), **plus** **epoch** turnarounds — **implementation-dependent**. **Single-port A only** doubles strip cycles per scan (**`t = 0…7`** unique). **BF16 16×128** behaves identically (same `E`, same `row_B`).
 
 **§9 `c*`** metrics still bound **tree / strip** complexity; they **exclude** **transpose scratch**, **`#W`** **tile replays**, **`f`**, **`N_run`**, **TRegFile** **non-gather** replay — add explicitly in schedules (**§5.3.2**).
 
@@ -495,7 +448,7 @@ For each **row r**, compute `acc[r] = reduce_{c} M[r,c]`.
 
 (i.e. **`num_col / num_acc`**, rounded up): each **wave** is one **complete** **row-major** scan of the operand tile, updating a **disjoint band** of **at most `N_acc`** columns’ **`Acc[c]`** toward the final **R**-way reduce.
 
-**Tree-limited wave count (`N_tree ≪ N_acc`):** Define **`f`** as the **effective number of distinct `Acc[c]` commits** each **single** **adder tree** can **sustain per full operand tile scan** (one **dual-port** ingest of **all** strips, e.g. **`t = 0…3`** in Example H), **after** **pipelining** and **sub-cycle** multiplex (**`f`** counts **tree→Acc** **throughput** over the **whole** scan — product of **commits per strip-beat** × **number of beats**, **bypass**, and **stage depth**). If **trees** cannot **produce** partials fast enough to **match** **`#waves_acc`**, **more** **tile replays** are needed:
+**Tree-limited wave count (`N_tree ≪ N_acc`):** Define **`f`** as the **effective number of distinct `Acc[c]` commits** each **single** **adder tree** can **sustain per full operand tile scan** (one **dual-port** ingest of **all** strips, e.g. **`t = 0…3`** in Example E), **after** **pipelining** and **sub-cycle** multiplex (**`f`** counts **tree→Acc** **throughput** over the **whole** scan — product of **commits per strip-beat** × **number of beats**, **bypass**, and **stage depth**). If **trees** cannot **produce** partials fast enough to **match** **`#waves_acc`**, **more** **tile replays** are needed:
 
 **`#waves_tree = ⌈C / (N_tree · f)⌉`**
 
@@ -519,7 +472,7 @@ When **`N_tree · f ≥ N_acc`**, **`#waves_tree ≤ #waves_acc`** and **`#W = m
 
 **When `N_acc ≤ N_tree`:** **Acc** is the **bottleneck** for **parallel column retires**; **`#waves_acc`** **still** applies; **`min(N_tree, N_acc) = N_acc`** caps **simultaneous** combine+retire per beat unless **pipelining** exposes extra **tree** throughput. **Also** evaluate **`#waves_tree`** if **`f`** is **small**.
 
-**Design shorthand:** **`P_beat = min(N_tree, N_acc)`** for **strict** same-cycle **tree→Acc** pairing; **tile-replay** uses **`#W`** above — see **§4.4 Example H**.
+**Design shorthand:** **`P_beat = min(N_tree, N_acc)`** for **strict** same-cycle **tree→Acc** pairing; **tile-replay** uses **`#W`** above — see **§4.4 Example E**.
 
 **`TROW*` mirror (row-axis output fibers, `fiber_id = r`):** same **symbols** **`N_tree`**, **`N_acc`**, **`N_run`**, **`f`** (**`f`** = **effective `Acc[r]` commits per tree per full operand scan** on the **row-reduce** calendar). **Replace `C` → `R`:**
 
@@ -527,7 +480,7 @@ When **`N_tree · f ≥ N_acc`**, **`#waves_tree ≤ #waves_acc`** and **`#W = m
 
 **§5.3.1** **Phase B** **strip** **walk** **replays** apply. **`⌈R / N_run⌉`** is **redundant** **vs** **`⌈R / N_acc⌉`** **when** **`N_acc ≤ N_run`** — **same** **as** **`TCOL*`**.
 
-For each **column c**, reduce across **rows** (**R** elements). In **row-major** storage, a column is **not** one contiguous byte range unless **`C = 1`**. **Implementation:** TRegFile delivers **only** full **512 B** strips (**§3.1** — **no gather**). Hardware **re-reads** the operand tile’s strips in **Gs** order (possibly **many TRegFile epochs** with the **same** `reg_idx`); after each read, **strip buffers A/B** hold **row-contiguous** data; **unpack** + **column mux** (VEC-side, **not** in the RF) extracts **`(r,c)`** for the **column band** scheduled that beat; **Acc[`c`] read–modify–write** accumulates partial sums until all **R** rows are covered. If **`N_acc < C`**, **repeat** the **full strip walk** for the next column band (**§4.4 Example H**). **Blocked partials** and **multi-cycle** calendars (**§4.3**) apply.
+For each **column c**, reduce across **rows** (**R** elements). In **row-major** storage, a column is **not** one contiguous byte range unless **`C = 1`**. **Implementation:** TRegFile delivers **only** full **512 B** strips (**§3.1** — **no gather**). Hardware **re-reads** the operand tile’s strips in **Gs** order (possibly **many TRegFile epochs** with the **same** `reg_idx`); after each read, **strip buffers A/B** hold **row-contiguous** data; **unpack** + **column mux** (VEC-side, **not** in the RF) extracts **`(r,c)`** for the **column band** scheduled that beat; **Acc[`c`] read–modify–write** accumulates partial sums until all **R** rows are covered. If **`N_acc < C`**, **repeat** the **full strip walk** for the next column band (**§4.4 Example E**). **Blocked partials** and **multi-cycle** calendars (**§4.3**) apply.
 
 **Metrics parity (§9):** Closed-form **`c*`** symbols match the **mathematical** **`TROW*`-on-`C×R`** substitution (**transpose-equivalent indices only**). That **algebra** does **not** imply a **physical** transpose buffer — it sizes **trees**, **`cS`**, **`cW`**, and **SRAM**; **wall-clock** must add **strip replay** and **`#W = max(⌈C / N_acc⌉, ⌈C / (N_tree · f)⌉, ⌈C / N_run⌉)`** **full-tile** **epochs** (**`f`**, **`N_run`** per **§5.3.2** / **§9.3.2**).
 
@@ -673,7 +626,7 @@ flowchart TB
 1. **Opcode decode** produces **control** for the **§4.1** **crossbar**, **(A)** **align/unpack/permute** (**per-slice** **`W_prep,i`**), **(B)** **128** **groups** (**ALU** **`W_ALU,i`**, **tree** **`W_tree,i`**, **`W_ALU,i ≥ W_tree,i`** **allowed**), **Acc** ping-pong **addresses**, **per-slot** **RMW** **vs** **bypass-to-DFF** (**§9.3.2**), **Wr half-select**, and a **strip read calendar** (**§4.3**): per-cycle **Rd0/Rd1** targets, **strip index** phase, **`fiber_id`** / **Acc** side effects. Parameters include strip loop count, **`TCOL*`** **wave** / **`N_acc`** / **`N_tree`** / **`f`** (§5.3.2), **`N_run`** / **`ρ` remap**, **`K_outer`**, **write-side staging**, **splat** / merge **k**, §9 **`r*`** / **`c*`** template id (**47** families). **`TCOL*`** **replays** over **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`** when **`#W > 1`**; **no transpose-scratch**; **no RF gather** (**§3.1**).
 2. **Determinism:** PTO ops are expected to be **deterministic** at the tile level; multi-cycle internal scheduling is **invisible** if the instruction **retires atomically** from the programmer’s view (barriers via **`TSYNC`** as needed).
 3. **Resource conflicts:** with only **two** read ports, **TMRGSORT** and **column-reduce** should **stall** other TRegFile clients or use **dedicated tiles** for **algorithmic** ping-pong (e.g. sort lists) — **not** for a **transpose scratchpad** forbidden by **§5.3.2**.
-4. **Numerics:** FP4/FP8 ops may specify **internal FP16/FP32** evaluation; document **rounding** per `TCVT` / ISA rules.
+4. **Numerics:** FP16 / BF16 reductions are evaluated with an **FP32-widened accumulator** and rounded per `TCVT` / ISA rules on retire.
 
 ---
 
@@ -684,15 +637,13 @@ This section **enumerates every** combination of **logical format** and **tile s
 ### 9.1 Enumeration rules
 
 - Tile storage: **4096 bytes**, row-major, **R** and **C** powers of two.
-- **N = R·C = 4096 / E** with **E** bytes per logical element:
+- **N = R·C = 4096 / E** with **E** bytes per logical element (**only two supported storage widths**):
   - **FP32:** `E = 4`, `N = 1024`, **11** shapes.
   - **FP16** and **BF16:** `E = 2`, `N = 2048`, **12** shapes each (**24** table rows).
-  - **FP8:** `E = 1`, `N = 4096`, **13** shapes.
-  - **MXFP4** and **HiFP4:** `E = ½`, `N = 8192`, **14** shapes each (**28** table rows).
 
-**Master table rows:** **76**. **Unique `(E, R, C)` geometries:** **50**.
+**Master table rows:** **35**. **Unique `(E, R, C)` geometries:** **23** (FP16 and BF16 share shapes).
 
-`elem_per_strip = 512/E` (for `E = ½`, **1024** elements per 512 B).
+`elem_per_strip = 512 / E` — **128** FP32 elements or **256** FP16 / BF16 elements per 512 B strip.
 
 ### 9.2 Row-axis metrics (`TROW*`)
 
@@ -726,7 +677,7 @@ For each **column** fiber, reduce **R** elements. **Logical bytes per column** (
 | **cUB** | `4 + 8·cW + C·cDc` (note **`C`** column outputs, not `R`). |
 | **cAccB** / **cStgUB** | Partial state (bytes): §9.3.1 — **`4·C`** logical running; **`4·C·cS`** staged upper bound; **physical running** **`N_run`** (**§9.3.2**). |
 
-**Row-major hardware path:** scheduling uses the **same numeric** `(cS, cK, cDl, cDc, cW)` for **strip-sequential reads**, **partial state**, **VEC column extraction**, and **cross-strip merge** on the **operand tile**; **cLB/cUB** **exclude** **TTRANS** / **transpose-scratch** (**§5.3.2**) and **exclude** **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`** **tile replays**, **`f`**, and **`N_run`** (**§5.3.2**). **Multi-epoch** **`reg_idx`** replay (**§4.4 Example H**) may dominate wall-clock.
+**Row-major hardware path:** scheduling uses the **same numeric** `(cS, cK, cDl, cDc, cW)` for **strip-sequential reads**, **partial state**, **VEC column extraction**, and **cross-strip merge** on the **operand tile**; **cLB/cUB** **exclude** **TTRANS** / **transpose-scratch** (**§5.3.2**) and **exclude** **`#W = max(⌈C/N_acc⌉, ⌈C/(N_tree·f)⌉, ⌈C/N_run⌉)`** **tile replays**, **`f`**, and **`N_run`** (**§5.3.2**). **Multi-epoch** **`reg_idx`** replay (**§4.4 Example E**) may dominate wall-clock.
 
 ### 9.3.1 Partial accumulator state (`TROW*` / `TCOL*`)
 
@@ -793,7 +744,7 @@ Both axes assume **§3.2** unary ingest: **4 cycles** minimum to read the full t
 
 The datapath is **one logical pipeline** reused by all table rows; its **effective shape** is selected by microcode from the **`r*`** or **`c*`** fields.
 
-1. **Unpack** maps a 512 B strip to up to **1024** logical lanes (FP4) / **512** (FP8) / … — **physical SIMD** may be narrower; the **logical** tree depth is still **⌈log₂ K⌉**.
+1. **Unpack** maps a 512 B strip to up to **256** logical lanes (FP16 / BF16) or **128** lanes (FP32) — **physical SIMD** may be narrower; the **logical** tree depth is still **⌈log₂ K⌉**.
 
 2. **Cross-lane tree (variable fan-in K):** implement as **`D_lane = ⌈log₂ K⌉`** stages of **pairwise** reduce ops. **K** jumps with `(format, R, C)`:
    - **`rK`** (row) depends primarily on **`C`** when `rS=1`, else fixed **`512/E`**.
@@ -820,12 +771,12 @@ flowchart LR
 
 | Counting notion | Value | Meaning |
 |-----------------|------:|---------|
-| **Physical datapaths** | **1** | One reducer suffices if it supports **max K = 1024**, **max `D_lane` = 10**, **max `S` = 8** (`D_cross ≤ 3`), with **per-stage bypass** and **programmable lane mask**. |
-| **Unique `(D_lane, D_cross, W_strip)` tuples** | **47** | Distinct **time-scheduling recipes** for **either** axis, over all **50** geometries (same 47-set for row **or** column as multiset over shapes). |
-| **Unique `(S, K, D_lane, D_cross)` quartets** | **23** | Coarser strip + tree fingerprint (per axis). |
-| **Unique paired `(row tuple, column tuple)`** | **50** | One pair per **`(E,R,C)`**; **square** shapes have **identical** row and column metrics. |
+| **Physical datapaths** | **1** | One reducer suffices if it supports **max K = 256** (FP16 / BF16), **max `D_lane` = 8**, **max `S` = 8** (`D_cross ≤ 3`), with **per-stage bypass** and **programmable lane mask**. |
+| **Unique `(D_lane, D_cross, W_strip)` tuples** | **22** | Distinct **time-scheduling recipes** for **either** axis, over all **23** geometries (FP32 contributes 11, FP16 / BF16 contribute 12; only the trivial `(0,0,0)` tuple is shared). |
+| **Unique `(S, K, D_lane, D_cross)` quartets** | **15** | Coarser strip + tree fingerprint (per axis), after eliminating overlap between FP32 and FP16 quartet sets. |
+| **Unique paired `(row tuple, column tuple)`** | **23** | One pair per **`(E,R,C)`** (FP16 and BF16 share shapes, so BF16 adds no new pairs); **square** shapes have **identical** row and column metrics. |
 
-So: **one** parameterized **tree + cross-strip** unit covers the whole table; firmware/microcode must hold **47** **scheduling templates** (or equivalent parameterized loops) per axis, not **76** different RTL blocks.
+So: **one** parameterized **tree + cross-strip** unit covers the whole table; firmware/microcode must hold **22** **scheduling templates** (or equivalent parameterized loops) per axis, not **35** different RTL blocks.
 
 ### 9.6 Summary by format (extrema over all legal shapes)
 
@@ -833,16 +784,14 @@ Maxima over **both** axes are **identical** for each format family (swap **R↔C
 
 | Format | N | # shapes | max **K** (either axis) | max **D_lane** | max **S** | max **D_cross** | min *LB* | max *LB* | max *UB* (r or c) | max **rAccB** / **cAccB** | max **rStgUB** / **cStgUB** |
 |--------|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FP32 | 1024 | 11 | 128 | 7 | 8 | 3 | 4 | 14 | 516 | 4096 | 32768 |
-| FP16 / BF16 | 2048 | 12 | 256 | 8 | 8 | 3 | 4 | 15 | 1028 | 8192 | 32768 |
-| FP8 | 4096 | 13 | 512 | 9 | 8 | 3 | 4 | 16 | 2052 | 16384 | 32768 |
-| MXFP4 / HiFP4 | 8192 | 14 | 1024 | 10 | 8 | 3 | 4 | 17 | 4100 | **32768** | **32768** |
+| FP32 | 1024 | 11 | 128 | 7 | 8 | 3 | 4 | 14 | 516 | 4096 | 4096 |
+| FP16 / BF16 | 2048 | 12 | 256 | 8 | 8 | 3 | 4 | 15 | 1028 | 8192 | 8192 |
 
-**Logical** peak **rAccB** / **cAccB** in the table is still **`4·R` / `4·C`** (up to **32 KiB** at **`R` or `C = 8192`**). **VEC-4K silicon** (**§9.3.2**): **running partials** = **`N_run = 512`** entries × **4 B** = **2048 B DFF**; **`R` or `C > 512`** uses **Acc waves** (**§9.3.1**). **rStgUB** / **cStgUB** remain **staging upper bounds** (still **≤ 32 KiB** per §2.1); **physical staging** may be a **small separate buffer** or **longer** microcode schedule.
+**Logical** peak **rAccB** / **cAccB** in the table is **`4·R` / `4·C`** (up to **8 KiB** at **`R` or `C = 2048`**, FP16 / BF16). **VEC-4K silicon** (**§9.3.2**): **running partials** = **`N_run = 512`** entries × **4 B** = **2048 B DFF**; **`R` or `C > 512`** uses **Acc waves** (**§9.3.1**). **rStgUB** / **cStgUB** remain **staging upper bounds** (**≤ 8 KiB** for the supported formats); **physical staging** may be a **small separate buffer** or **longer** microcode schedule.
 
 ### 9.7 Legal `(format, R×C)` enumeration
 
-**76** rows — same **master-table** row count as **§9.1** (**50** distinct **`(E, R, C)`** geometries; **FP16** vs **BF16** duplicate shapes). **Per-axis metrics** (`r*`, `c*`, **LB/UB**, **rAccB**, **cAccB**, **rStgUB**, **cStgUB**) are defined in **§9.2–9.3**; **format extrema** in **§9.6**.
+**35** rows — same **master-table** row count as **§9.1** (**23** distinct **`(E, R, C)`** geometries; **FP16** vs **BF16** duplicate shapes). **Per-axis metrics** (`r*`, `c*`, **LB/UB**, **rAccB**, **cAccB**, **rStgUB**, **cStgUB**) are defined in **§9.2–9.3**; **format extrema** in **§9.6**.
 
 | Format | E (B/elem) | N | R×C |
 |--------|------------|---|-----|
@@ -881,47 +830,6 @@ Maxima over **both** axes are **identical** for each format family (swap **R↔C
 | BF16 | 2 | 2048 | 512×4 |
 | BF16 | 2 | 2048 | 1024×2 |
 | BF16 | 2 | 2048 | 2048×1 |
-| FP8 | 1 | 4096 | 1×4096 |
-| FP8 | 1 | 4096 | 2×2048 |
-| FP8 | 1 | 4096 | 4×1024 |
-| FP8 | 1 | 4096 | 8×512 |
-| FP8 | 1 | 4096 | 16×256 |
-| FP8 | 1 | 4096 | 32×128 |
-| FP8 | 1 | 4096 | 64×64 |
-| FP8 | 1 | 4096 | 128×32 |
-| FP8 | 1 | 4096 | 256×16 |
-| FP8 | 1 | 4096 | 512×8 |
-| FP8 | 1 | 4096 | 1024×4 |
-| FP8 | 1 | 4096 | 2048×2 |
-| FP8 | 1 | 4096 | 4096×1 |
-| MXFP4 | 0.5 | 8192 | 1×8192 |
-| MXFP4 | 0.5 | 8192 | 2×4096 |
-| MXFP4 | 0.5 | 8192 | 4×2048 |
-| MXFP4 | 0.5 | 8192 | 8×1024 |
-| MXFP4 | 0.5 | 8192 | 16×512 |
-| MXFP4 | 0.5 | 8192 | 32×256 |
-| MXFP4 | 0.5 | 8192 | 64×128 |
-| MXFP4 | 0.5 | 8192 | 128×64 |
-| MXFP4 | 0.5 | 8192 | 256×32 |
-| MXFP4 | 0.5 | 8192 | 512×16 |
-| MXFP4 | 0.5 | 8192 | 1024×8 |
-| MXFP4 | 0.5 | 8192 | 2048×4 |
-| MXFP4 | 0.5 | 8192 | 4096×2 |
-| MXFP4 | 0.5 | 8192 | 8192×1 |
-| HiFP4 | 0.5 | 8192 | 1×8192 |
-| HiFP4 | 0.5 | 8192 | 2×4096 |
-| HiFP4 | 0.5 | 8192 | 4×2048 |
-| HiFP4 | 0.5 | 8192 | 8×1024 |
-| HiFP4 | 0.5 | 8192 | 16×512 |
-| HiFP4 | 0.5 | 8192 | 32×256 |
-| HiFP4 | 0.5 | 8192 | 64×128 |
-| HiFP4 | 0.5 | 8192 | 128×64 |
-| HiFP4 | 0.5 | 8192 | 256×32 |
-| HiFP4 | 0.5 | 8192 | 512×16 |
-| HiFP4 | 0.5 | 8192 | 1024×8 |
-| HiFP4 | 0.5 | 8192 | 2048×4 |
-| HiFP4 | 0.5 | 8192 | 4096×2 |
-| HiFP4 | 0.5 | 8192 | 8192×1 |
 
 ---
 
@@ -960,3 +868,4 @@ Maxima over **both** axes are **identical** for each format family (swap **R↔C
 | 0.21 | 2026-04-07 | **§4.1** **dataflow** diagram: **opcode+shape→control→crossbar** (**1024 B**), **`N_tree=128`**, **Acc** **256×32b×2** **ping-pong** **adder+fb**, **Wr half** → **Wr0+Wr1**; **§3.3** / **§4.2–4.3** / **§7–8** / **§9.3.2** / **§9.5** mermaid |
 | 0.22 | 2026-04-07 | **§4.1** / **§7**: split **(A)** **align/unpack/permute** vs **(B)** **128** **groups**; **W_prep,i** / **W_ALU,i** / **W_tree,i**; **W_ALU ≥ W_tree** |
 | 0.23 | 2026-04-07 | **Acc** **bypass**: **write-through** **to** **DFF** **without** **combine** **adder** (**§4.1**, **§9.3.2**, **§7–8**) |
+| 0.24 | 2026-04-20 | **Format simplification**: drop **FP8 / MXFP4 / HiFP4**; supported storage widths are now **FP32 (E=4)** and **FP16 / BF16 (E=2)** only. §2.1 table, §4.4 examples (D → FP16 `TROWSUM` 128×16; old E–H removed; new **E** = FP16 `TCOLSUM` 16×128 wave illustration), §9.1 / §9.5.1 / §9.6 extrema, §9.7 master table (35 rows / 23 unique shapes); all `FP8`/`FP4` / nibble-packed cross-refs retired. Peak **K = 256**, **D_lane = 8**, **max UB = 1028** (FP16 `512×4`). |
