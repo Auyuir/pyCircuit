@@ -31,15 +31,15 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
 | **TRegFile-4K read ports** | **8R, each with `is_transpose` bit** (§9.2) |
 | **Per-tile metadata** | **32 b** (shape.x, shape.y, format) §9.2.1 |
 | Fetch / decode width | **4** instructions / cycle |
-| Scalar issue width | **6** (4 ALU + 1 MUL/DIV + 1 branch) |
+| Scalar issue width | **7** (4 ALU + 1 MUL/DIV + 1 BRU from alu_iq; 2 LSU from lsu_iq) |
 | **Vector issue width** | **1 VEC-4K-v2 instruction / cycle** (§8.3) |
 | Cube issue width | **1** CUBE instruction / cycle |
 | MTE issue width | **2** TILE.LD/ST per cycle |
-| Pipeline depth (scalar) | **12** stages (fetch-to-writeback) |
+| Pipeline depth (scalar) | **17+** stages (fetch-to-writeback, with D1/D2/D3 rename and P1/I1/I2 issue separation) |
 | Branch predictor | Hybrid TAGE + BTB + RAS |
-| **RAT checkpoints** | **8** (max in-flight branches; same as v1, now repurposed as *speculation tags* §11.3) |
+| **MapQ depth** | **12** entries (speculative rename increment log; instruction-precise recovery via reverse replay; replaces RAT checkpoint snapshots) |
 | **Branch tag width** | **3 b** (matches checkpoint count); attached to every in-flight RS / store-buffer / tile-store-queue entry |
-| Reservation station entries | Scalar: 32, LSU: 24, **Vector: 24** (was 16; widened for 3-operand v2 entries), Cube: 4, MTE: 16 |
+| Physical IQ entries | Scalar ALU: **48**, Scalar BRU: **16**, LSU: **32**, Vector: **24**, Cube: **4**, MTE: **16** |
 | **Speculative store buffer entries** | **24** (was 16 in v1; widened to absorb branch-tag gating §11.4) |
 | **Speculative tile-store queue** | **8** entries (branch-tag-gated, MTE-side §11.5) |
 | L1-I cache | 64 KB, 4-way, 64 B line |
@@ -52,6 +52,23 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
 | Peak FP16 throughput (cube) | **12.3 TFLOPS** |
 | Peak FP8 throughput (cube) | **24.6 TOPS** |
 | Peak MXFP4 throughput (cube) | **98.3 TOPS** |
+
+### BCC-Style Scalar Pipeline Deltas (v2 BCC overlay)
+
+The following parameters supersede the corresponding v1/v2 entries above when the BCC scalar pipeline is enabled.
+
+| Parameter | Value |
+|-----------|-------|
+| **Scalar rename pipeline** | D1 (decode + RID/atag allocation) → D2 (SMAP read + ptag allocation + MapQ push) → D3 (rename complete + Ready Table init) |
+| **atag** | Architectural register index (0–31 for GPRs), replaces "architectural GPR" terminology |
+| **ptag** | Physical register index (P0–P127), replaces "physical GPR" / "P-reg" terminology |
+| **Rename tables** | CMAP (committed map, 32×7 b) + SMAP (speculative map, 32×7 b) + MapQ (12-entry ring buffer) |
+| **Physical IQ topology** | 3 separate physical IQs: `alu_iq` (48 entries, 4-wide issue), `bru_iq` (16 entries, 1-wide), `lsu_iq` (32 entries, 2-wide) |
+| **Wakeup mechanism** | **Ready Table** (128-bit bitmap; O(1) ptag lookup) — replaces CDB comparator arrays |
+| **Issue picker** | **Age-matrix cascaded pick** using RID-based sub-head age: `age = (entry.rid − head_rid) mod 64`; purely combinational, no per-entry age field |
+| **Issue stages** | P1 (age-matrix pick) → I1 (RF read-port arbitration) → I2 (confirm issue + IQ deallocation) |
+| **Wakeup latency** | 2 cycles (Ready Table register → can_issue → pick → RF read) |
+| **Flush model** | MapQ reverse replay from `flush_rid` → SMAP restored to exact CMAP state; branch-tag CAM-clear on physical IQs |
 
 ---
 
@@ -467,143 +484,163 @@ The 7-bit opcode field encodes the instruction domain:
 ## 3. Top-Level Block Diagram
 
 ```
- ┌──────────────────────────────────────────────────────────────────────────────────────┐
- │  DAVINCI-v2 CORE                                                                     │
- │                                                                                      │
- │  ┌─────────────────────────────── FRONT-END ──────────────────────────────────────┐  │
- │  │   ┌──────────┐    ┌───────────┐    ┌──────────────────────────────────┐        │  │
- │  │   │  Branch   │───▶│  Fetch    │───▶│  Instruction Buffer (16 entries) │        │  │
- │  │   │ Predictor │    │  Unit     │    │  4-wide dequeue                  │        │  │
- │  │   │ TAGE+BTB  │    │ (L1-I)    │    └──────────┬───────────────────────┘        │  │
- │  │   │ +RAS      │    └──────────┘               │ 4 instr/cy + branch tag         │  │
- │  │   └──────────┘                                ▼                                │  │
- │  │                              ┌───────────────────────────────────────────┐     │  │
- │  │                              │  Decode + Rename (4-wide)                  │     │  │
- │  │                              │  ┌───────┐  ┌──────────────┐               │     │  │
- │  │                              │  │Scalar │  │  Tile RAT     │               │     │  │
- │  │                              │  │ RAT   │  │  (32→256)     │               │     │  │
- │  │                              │  └───┬───┘  └──────┬───────┘               │     │  │
- │  │                              │  ┌───┴─────────────┴────────┐              │     │  │
- │  │                              │  │ Free Lists + Ref Counters  │              │     │  │
- │  │                              │  └───────────────────────────┘              │     │  │
- │  │                              │  ┌───────────────────────────┐              │     │  │
- │  │                              │  │ Checkpoint Store (8 slots) │              │     │  │
- │  │                              │  │ + Branch-tag allocator    │              │     │  │
- │  │                              │  └───────────────────────────┘              │     │  │
- │  │                              │  ┌───────────────────────────┐              │     │  │
- │  │                              │  │ Tile Metadata RAT (32→256)│              │     │  │
- │  │                              │  │  (32 b per phys tile)     │              │     │  │
- │  │                              │  └───────────────────────────┘              │     │  │
- │  │                              └──────────────┬──────────────────────────────┘     │  │
- │  └─────────────────────────────────────────────┼─────────────────────────────────────┘  │
- │                                                │ renamed µops + branch_tag              │
- │  ┌─────────────────────────── DISPATCH ────────┼───────────────────────────────────┐  │
- │  │                                             ▼                                  │  │
- │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │  │
- │  │  │Scalar RS │  │  LSU RS  │  │Vector RS │  │ Cube RS  │  │  MTE RS  │         │  │
- │  │  │(32 entry)│  │(24 entry)│  │(24 entry)│  │(4 entry) │  │(16 entry)│         │  │
- │  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘         │  │
- │  └───────┼──────────────┼─────────────┼─────────────┼──────────────┼───────────────┘  │
- │          │              │             │             │              │                  │
- │  ┌───────┼──────────── EXECUTE ───────┼─────────────┼──────────────┼───────────────┐  │
- │  │       ▼              ▼             ▼             ▼              ▼              │  │
- │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │  │
- │  │  │ 4× ALU   │  │  Load /  │  │  VEC-    │  │outerCube │  │   MTE    │         │  │
- │  │  │ 1× MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │  Engine  │         │  │
- │  │  │ 1× BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │(LD/ST/  │         │  │
- │  │  │          │  │  + SSB   │  │ tiles    │  │          │  │G/S/MOVE)│         │  │
- │  │  │          │  │  (24)    │  │ 1 tile/  │  │          │  │+ STQ(8) │         │  │
- │  │  │          │  │          │  │ 8 cy     │  │          │  │         │         │  │
- │  │  └─────┬────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬────┘         │  │
- │  └────────┼─────────────┼─────────────┼─────────────┼──────────────┼─────────────┘  │
- │           │             │             │             │              │                  │
- │  ┌────────┼──────────── COMPLETE ─────┼─────────────┼──────────────┼───────────────┐  │
- │  │  CDB (6 ports, scalar)  +  TCB (4 ports, tile)                                 │  │
- │  └────────────────────────────────────────────────────────────────────────────────┘  │
- │                                                                                      │
- │  ┌──────────────── REGISTER FILES ───────────────────────────────────────────────┐  │
- │  │  ┌──────────────────┐  ┌─────────────────────────────────────────────────────┐ │  │
- │  │  │ Scalar Physical   │  │ TRegFile-4K (with per-port is_transpose)            │ │  │
- │  │  │ Register File     │  │ 256×4KB = 1MB; 8R+8W @ 512B/cy/port                  │ │  │
- │  │  │ 128×64b           │  │ 8-cycle epoch calendar                                │ │  │
- │  │  │ 12R+6W ports      │  │ 32 b metadata per physical tile                       │ │  │
- │  │  │                   │  │ row-mode AND col-mode reads at full 512 B/cy          │ │  │
- │  │  └──────────────────┘  └─────────────────────────────────────────────────────┘ │  │
- │  └──────────────────────────────────────────────────────────────────────────────────┘  │
- │                                                                                      │
- │  ┌──────────────── MEMORY SUBSYSTEM ─────────────────────────────────────────────┐  │
- │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                                    │  │
- │  │  │  L1-I    │  │  L1-D    │  │  L2 (512 │───▶ External Bus / NoC              │  │
- │  │  │  64 KB   │  │  64 KB   │  │   KB)    │                                    │  │
- │  │  └──────────┘  └────┬─────┘  └──────────┘                                    │  │
- │  │                     ▲                                                        │  │
- │  │            ┌────────┴────────┐                                                │  │
- │  │            │ Spec Store Buf  │  (24 entries, branch-tag gated, §11.4)        │  │
- │  │            │ (SSB)           │                                                │  │
- │  │            └─────────────────┘                                                │  │
- │  │                     ▲                                                        │  │
- │  │            ┌────────┴────────┐                                                │  │
- │  │            │ Spec Tile-Store │  (8 entries, branch-tag gated, §11.5)         │  │
- │  │            │ Queue (STQ)     │  drains TILE.ST / TILE.SCATTER                 │  │
- │  │            └─────────────────┘                                                │  │
- │  │                     ▲                                                        │  │
- │  │                     │ from MTE                                               │  │
- │  └──────────────────────────────────────────────────────────────────────────────┘  │
- └──────────────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │  DAVINCI-v2 CORE (BCC Scalar Pipeline)                                                        │
+ │                                                                                              │
+ │  ┌─────────────────────────────── FRONT-END ──────────────────────────────────────────────┐  │
+ │  │   ┌──────────┐    ┌───────────┐    ┌──────────────┐   ┌──────────────┐              │  │
+ │  │   │  Branch   │───▶│  Fetch    │───▶│  IB (8 entries)│───▶│  F4 Register  │              │  │
+ │  │   │ Predictor │    │  (F0-F3)  │    │  4-wide sync  │   │  D1 handoff  │              │  │
+ │  │   │ TAGE+BTB  │    └──────────┘    └──────────────┘   └──────┬───────┘              │  │
+ │  │   │ +RAS      │                                                 │                        │  │
+ │  │   └──────────┘                                                 ▼                        │  │
+ │  │                              ┌─────────────────────────────────────────────┐             │  │
+ │  │                              │  D1: Decode + RID / atag Allocation        │             │  │
+ │  │                              │  - 4-wide decode (domain, opcode, operands)│             │  │
+ │  │                              │  - RID allocation (6-bit program order)      │             │  │
+ │  │                              └─────────────────┬───────────────────────┘             │  │
+ │  │                                                ▼                                       │  │
+ │  │                              ┌─────────────────────────────────────────────┐             │  │
+ │  │                              │  D2: Rename Request                         │             │  │
+ │  │                              │  - SMAP read for source ptags               │             │  │
+ │  │                              │  - ptag allocation from free list            │             │  │
+ │  │                              │  - MapQ push (speculative increment log)    │             │  │
+ │  │                              │  - SMAP live update (intra-group bypass)    │             │  │
+ │  │                              │  - Tile RAT / Tile-Meta RAT unchanged        │             │  │
+ │  │                              └─────────────────┬───────────────────────┘             │  │
+ │  │                                                ▼                                       │  │
+ │  │                              ┌─────────────────────────────────────────────┐             │  │
+ │  │                              │  D3: Rename Complete + Dispatch Prep        │             │  │
+ │  │                              │  - SMAP write (committed state)             │             │  │
+ │  │                              │  - Ready Table init (source ready bits)     │             │  │
+ │  │                              │  - IQ routing (alu_iq / bru_iq / lsu_iq)   │             │  │
+ │  │                              └─────────────────┬───────────────────────┘             │  │
+ │  └────────────────────────────────────────────────┼────────────────────────────────────────┘  │
+ │                                                   │ renamed muops + RID + ptags + MapQ entry      │
+ │  ┌────────────────────────────────────────────────┼────────────────────────────────────────┐  │
+ │  │                                                ▼                                        │  │
+ │  │  ┌──────────────────────────────────┐  ┌──────────────────────────────────────────┐  │  │
+ │  │  │  S1: Dispatch Preparation         │  │  S2: Dispatch Execute                    │  │  │
+ │  │  │  - Free list vacancy check        │  │  - IQ entry write (alu_iq / bru_iq /   │  │  │
+ │  │  │  - MapQ space check             │  │    lsu_iq)                             │  │  │
+ │  │  │  - IQ vacancy per type            │  │  - Free list update                    │  │  │
+ │  │  └──────────────────────────────────┘  │  - MapQ head advance                   │  │  │
+ │  │                                           └───────────────────┬──────────────────┘  │  │
+ │  │                                                               ▼                      │  │
+ │  │  ┌──────────────────────────────────┐  ┌──────────────────────────────────────────┐  │  │
+ │  │  │  P1: Issue Pick                  │  │  I1: RF Read Planning   │ I2: Confirm  │  │  │
+ │  │  │  - Ready Table bitmap query       │  │  - RF port arbitration  │  - IQ entry  │  │  │
+ │  │  │    (O(1) bit-test per ptag)     │  │  - 7-wide across IQs   │    dealloc   │  │  │
+ │  │  │  - Age-matrix cascaded pick       │  │                        │  - Port conf  │  │  │
+ │  │  │    (RID-based sub-head age)       │  │                        │              │  │  │
+ │  │  └──────────────────────────────────┘  └──────────────────────────────────────────┘  │  │
+ │  └───────────────────────────────────────────────────────────────────────────────────┘  │
+ │                                                                                              │
+ │  ┌─────────────────────────── EXECUTE ────────────────────────────────────────────────────┐  │
+ │  │       ▼              ▼             ▼             ▼              ▼                      │  │
+ │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐              │  │
+ │  │  │ 4x ALU   │  │  Load /  │  │  VEC-    │  │outerCube │  │   MTE    │              │  │
+ │  │  │ 1x MUL   │  │  Store   │  │  4K-v2   │  │   MXU    │  │  Engine  │              │  │
+ │  │  │ 1x BRU   │  │  Unit    │  │ 3R/2W    │  │(4096 MAC)│  │(LD/ST/  │              │  │
+ │  │  │ (alu_iq) │  │  + SSB   │  │ tiles    │  │          │  │G/S/MOVE)│              │  │
+ │  │  │          │  │ (lsu_iq) │  │(vec_iq)  │  │          │  │+ STQ(8) │              │  │
+ │  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘              │  │
+ │  └────────┼─────────────┼─────────────┼─────────────┼──────────────┼────────────────────┘  │
+ │           │             │             │             │              │                          │
+ │  ┌────────┼──────────── COMPLETE ─────┼─────────────┼──────────────┼────────────────────┐    │
+ │  │  CDB (6 ports, scalar)  +  TCB (4 ports, tile) + Ready Table (128-bit bitmap)      │    │
+ │  │  Ready Table: set bit[i] = ptag i ready on CDB writeback; clear on ptag alloc      │    │
+ │  └────────────────────────────────────────────────────────────────────────────────────────┘    │
+ │                                                                                              │
+ │  ┌──────────────── REGISTER FILES ───────────────────────────────────────────────────────┐  │
+ │  │  ┌──────────────────┐  ┌─────────────────────────────────────────────────────────────┐│  │
+ │  │  │ Scalar Physical   │  │ TRegFile-4K (with per-port is_transpose)                  ││  │
+ │  │  │ Register File     │  │ 256x4KB = 1MB; 8R+8W @ 512B/cy/port                      ││  │
+ │  │  │ 128x64b          │  │ 8-cycle epoch calendar                                    ││  │
+ │  │  │ 12R+6W ports     │  │ 32 b metadata per physical tile                          ││  │
+ │  │  └──────────────────┘  └─────────────────────────────────────────────────────────────┘│  │
+ │  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+ │                                                                                              │
+ │  ┌──────────────── RENAME STATE ─────────────────────────────────────────────────────────┐  │
+ │  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────────────┐           │  │
+ │  │  │ CMAP [32x7b]   │  │ SMAP [32x7b]   │  │ MapQ [12-entry ring buffer]   │           │  │
+ │  │  │ Committed map    │  │ Speculative map │  │ {atag, old_ptag, new_ptag,    │           │  │
+ │  │  │ Flush target     │  │ Active rename   │  │  rid, is_push_t/u}            │           │  │
+ │  │  └────────────────┘  └────────────────┘  └────────────────────────────────┘           │  │
+ │  └──────────────────────────────────────────────────────────────────────────────────────────┘  │
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**v2 deltas highlighted:**
+**BCC scalar pipeline deltas (highlighted):**
 
-- Branch-tag allocator at rename / checkpoint store.
-- Tile Metadata RAT (32 b per physical tile) co-located with the Tile RAT.
-- VEC-4K-v2 unit replaces v1 vector unit; 3R / 2W tile interface.
-- Speculative Store Buffer (SSB, 24 entries) gates scalar stores by branch tag.
-- Speculative Tile-Store Queue (STQ, 8 entries) gates MTE bulk stores by branch tag.
+- **Three-stage rename pipeline**: D1 (decode + RID/atag allocation) -> D2 (SMAP read + ptag allocation + MapQ push) -> D3 (SMAP write + Ready Table init + IQ routing)
+- **Three physical IQs**: `alu_iq` (48 entries, 4-wide), `bru_iq` (16 entries, 1-wide), `lsu_iq` (32 entries, 2-wide) — replace centralized Scalar RS
+- **Ready Table** (128-bit bitmap): replaces CDB comparator arrays for scalar wakeup; O(1) ptag lookup per source
+- **Age-matrix issue picker**: purely combinational cascaded pick using RID-based sub-head age (no per-entry age field)
+- **P1/I1/I2 issue stages**: explicit pick (P1) / RF-read arbitration (I1) / confirm (I2) separation
+- **MapQ** (12-entry ring buffer): replaces RAT checkpoint snapshots; instruction-precise recovery via reverse replay
+- **atag / ptag naming**: architectural registers = atag (0-31), physical registers = ptag (P0-P127)
+- **CMAP + SMAP + MapQ**: three-table rename model (committed / speculative / increment log)
+- Branch-tag allocator at rename (unchanged from v2).
+- Tile Metadata RAT (32 b per physical tile) co-located with the Tile RAT (unchanged).
+- VEC-4K-v2 unit; 3R / 2W tile interface (unchanged).
+- Speculative Store Buffer (SSB, 24 entries) gates scalar stores by branch tag (unchanged).
+- Speculative Tile-Store Queue (STQ, 8 entries) gates MTE bulk stores by branch tag (unchanged).
+
+---
+
 
 ---
 
 ## 4. Pipeline Overview
 
-> **(v1 → v2: 4.A / 4.B / 4.C 完整复制自 v1 §4.1 / §4.2 / §4.3。流水线深度、阶段定义、各域执行延迟未变更。v2 增量集中在 §4.1 / §4.2 / §4.3。)**
-
-The v2 scalar pipeline is the same **12 stages** as v1 (no retire/commit stage). Branch-tag administration adds zero cycles — tags are allocated at D2 (alongside the existing checkpoint allocation) and propagated forward as one extra metadata field per RS entry.
+The Davinci-v2 scalar pipeline is extended to **17+ stages** with the BCC-style scalar frontend. Branch-tag administration adds zero cycles — tags are allocated at D2 (alongside MapQ entry push) and propagated forward as one extra metadata field per IQ entry. The Tile RAT, Vector RS, Cube RS, MTE RS, and memory subsystems are unchanged by the BCC scalar pipeline change.
 
 ```
- F1 → F2 → D1 → D2 → DS → IS → EX1 → EX2 → EX3 → EX4 → WB → (no retire)
- ├── Fetch ──┤├─ Decode/Rename ─┤├DS┤├IS┤├──── Execute ────────┤├WB┤
-                       │
-                       └── allocate branch_tag ∈ {0..7} for each in-flight branch
-                       └── flash-copy {Scalar RAT, Tile RAT, Tile-Meta RAT,
-                                       free-list heads, RAS top, SSB head, STQ head}
-                                       into checkpoint[tag]
+F0 → F1 → F2 → F3 → IB → F4 → D1 → D2 → D3 → S1 → S2 → P1 → I1 → I2 → E1 → … → EX_n → W1
+                                     ├── Rename ──┤           ├── Issue ──┤           ├── Execute ──┤
 ```
 
-### 4.A Pipeline Stages (v1 §4.1, 未变更)
+### 4.1 Complete Stage List (BCC Scalar Pipeline)
 
 | Stage | Name | Function |
-|-------|------|----------|
-| F1 | Fetch-1 | Send PC to L1-I cache and branch predictor |
-| F2 | Fetch-2 | Receive 4 instructions from I-cache; apply BTB/TAGE prediction |
-| D1 | Decode | Decode 4 instructions; identify domain (scalar/vector/cube/MTE) |
-| D2 | Rename | Read Scalar RAT + Tile RAT (+ Tile-Meta RAT in v2); allocate physical registers/tiles; intra-group bypass; checkpoint all RATs on branch; *(v2)* allocate branch_tag |
-| DS | Dispatch | Allocate reservation station entry; write operand tags/data; *(v2)* allocate SSB/STQ slot for memory-side stores |
-| IS | Issue | Select oldest ready instruction per functional unit; read physical RF |
-| EX1–EXn | Execute | Variable latency: ALU=1cy, MUL=4cy, LD=4cy(L1 hit), VEC=16cy(2 epochs, elementwise), MTE=8–72cy(epoch+mem), DIV=12–20cy |
-| WB | Writeback | Broadcast result on CDB/TCB; write to physical RF / TRegFile-4K; wakeup dependent RS entries; *(v2)* SSB/STQ entries become drain-ready when branch_tag clears |
+|-------|------|---------|
+| F0 | Fetch PC Select | PC mux (redirect/sequential/flush) |
+| F1 | I-Cache Lookup + BTB | Tag+BTB lookup, 4-way set-assoc |
+| F2 | I-Cache Response + Predict | Cache data return, TAGE/BTB prediction |
+| F3 | Stitch + BSTART Annotation | Cross-line stitch, BSTART boundary marking (deferred; N/A in this change) |
+| IB | Instruction Buffer | Depth-8 fetch/decode synchronization buffer |
+| F4 | Decode Handoff Register | D1 input register |
+| **D1** | **Decode + RID / atag Allocation** | Decode 4 instr, allocate RID (6-bit program-order ID), resolve atag for sources |
+| **D2** | **Rename Request** | Read SMAP, resolve source ptag, allocate ptag, push MapQ entry, T/U stack push |
+| **D3** | **Rename Complete + Dispatch Prep** | Write SMAP, resolve source readiness from Ready Table, IQ routing assignment |
+| **S1** | **Dispatch Preparation** | IQ resource checks (free list, MapQ space, IQ vacancy per type) |
+| **S2** | **Dispatch Execute** | IQ entry write, free list update, MapQ head advance |
+| **P1** | **Issue Pick** | Ready Table combinational query, age-matrix cascaded pick (RID-based sub-head age) |
+| **I1** | **Operand Read Planning** | Global physical RF read-port arbitration |
+| **I2** | **Issue Confirm** | IQ entry deallocation, RF read-port occupancy confirm |
+| E1–EX_n | Execute | Functional unit execution (variable latency) |
+| W1 | Writeback | CDB/TCB broadcast, Ready Table update, wakeup |
 
-### 4.B Pipeline Timing — Scalar ALU Instruction (v1 §4.2, 未变更)
+**Total pipeline depth**: Fetch-to-WB = **17+ cycles** (~5 cycles longer than the 12-stage v1/v2 baseline, due to D1/D2/D3 rename split and P1/I1/I2 issue separation).
+
+### 4.B Pipeline Timing — Scalar ALU Instruction (BCC Scalar Pipeline)
 
 ```
-  Cycle:  0    1    2    3    4    5    6    7
-  ─────  ────  ────  ────  ────  ────  ────  ────
-  i0:    F1   F2   D1   D2   DS   IS   EX1  WB
-  i1:    F1   F2   D1   D2   DS   IS   EX1  WB
-  i2:    F1   F2   D1   D2   DS   IS   EX1  WB
-  i3:    F1   F2   D1   D2   DS   IS   EX1  WB
-         └──── 4-wide ────────┘
+  Cycle:  0    1    2    3    4    5    6    7    8    9    10   11   12
+  ─────  ────  ────  ────  ────  ────  ────  ────  ────  ────  ────  ────  ────  ────
+  i0:    F0   F1   F2   F3   IB   F4   D1   D2   D3   S1   S2   P1   I1   I2  E1  WB
+  i1:           F0   F1   F2   F3   IB   F4   D1   D2   D3   S1   S2   P1   I1   I2  E1  WB
+  i2:                  F0   F1   F2   F3   IB   F4   D1   D2   D3   S1   S2   P1   I1   I2  E1  WB
+  i3:                         F0   F1   F2   F3   IB   F4   D1   D2   D3   S1   S2   P1   I1   I2  E1  WB
+         └──────────────── 6-cycle fetch-to-D1 ──────────────────┘
+                                        └──── Rename ────┘
+                                                └──── S ──┘  └─ P/I ─┘
 ```
 
-### 4.C Execution Latencies by Domain (v1 §4.3, 未变更)
+**Note:** Pipeline timing is shown for a single-cycle ALU operation. The 17+ stage pipeline means an instruction takes ~11 cycles from D1 to WB. The additional latency does not reduce throughput — all 4 slots of each pipeline stage are occupied every cycle, maintaining 4-wide dispatch rate. Variable-latency ops (MUL, DIV, LD) follow the same stage layout but occupy EX for additional cycles.
+
+### 4.C Execution Latencies by Domain (unchanged from v2)
 
 | Domain | Operation | Stages | Latency (cycles) | Pipelined |
 |--------|-----------|--------|-------------------|-----------|
@@ -632,31 +669,41 @@ The v2 scalar pipeline is the same **12 stages** as v1 (no retire/commit stage).
 
 ---
 
-### 4.1 Per-stage actions (v2 deltas)
+### 4.3 Per-stage Actions (BCC Scalar Pipeline)
 
-| Stage | v2 deltas |
-|-------|-----------|
-| **D2 — Rename** | Allocate branch_tag if instruction is a branch; tag propagates to every younger instruction's RS entry. Checkpoint (§5/§6) now also snapshots **SSB head pointer** and **STQ head pointer**. |
-| **DS — Dispatch** | Dispatched RS entry includes `branch_tag` (3 b). LSU stores additionally allocate an SSB slot tagged with the same branch_tag. MTE bulk-stores allocate an STQ slot. |
-| **IS — Issue** | No change (RS wakeup on tag-match for source operands). |
-| **EX — Execute** | LSU stores deposit data + address into the SSB slot, but do **not** commit to L1-D. MTE bulk-stores deposit address-list + data into the STQ slot, but do **not** drain to memory. Both wait for `branch_tag → non-speculative` (§11.4, §11.5). |
-| **WB — Writeback** | Unchanged for scalar/tile *register* destinations. Memory-side commits gated on tag-clear from the speculation tracker. |
+| Stage | Function |
+|-------|---------|
+| **D1** | Decode 4 instr; allocate RID (6-bit program-order ID); resolve atag for each source operand; classify each operand as P (GPR, 32 regs), T (tile, 32 regs), or U (uncore) |
+| **D2** | Read SMAP for source ptags; allocate new ptag for P-dst; push MapQ entry; update SMAP (live for intra-group bypass); T/U stack push for tile/uncore operands |
+| **D3** | Write SMAP to committed state; initialize Ready Table source-ready bits from Ready Table query; assign IQ routing (alu_iq / bru_iq / lsu_iq) |
+| **S1** | Check free list vacancy, MapQ space, IQ vacancy per routing target |
+| **S2** | Write IQ entries; advance free list head; advance MapQ head |
+| **P1** | Ready Table combinational query; age-matrix cascaded pick selects oldest-ready entries per IQ |
+| **I1** | Physical RF read-port arbitration across 7 issue slots (alu_iq x 4 + bru_iq x 1 + lsu_iq x 2) |
+| **I2** | Confirm IQ entry deallocation; confirm RF port occupancy |
+| **E1-EX_n** | Functional unit execution; CDB/TCB broadcast at W1 |
+| **W1** | Ready Table bitmap update: clear allocated ptag bits (D2 to W1 = 8 cycles after rename); set ptag bits on CDB writeback |
 
-### 4.2 Pipeline timing (v2 增量说明)
+### 4.4 Pipeline Timing Notes
 
-Scalar ALU, MUL, LD, branch resolve, and elementwise-vector timing (epoch-pipelined at 1 tile/8 cy) are all preserved as in §4.B / §4.C above. The only timing change in v2 is the **variable operand-fetch prologue** of VEC-4K-v2 (§8.3.6): `T_fetch ∈ {8 cy, 16 cy}` depending on `is_xpose_*` mix among the 3 source tiles. End-to-end vector-instruction latency is unchanged for uniformly-transposed (or uniformly-non-transposed) operands.
+- All execution latencies (Section 4.C) are measured from the E1 stage, not from fetch. The extended pipeline does not change the functional unit latencies.
+- Variable-latency ops (MUL, DIV, LD) follow the same D1/D2/D3/S1/S2/P1/I1/I2/E1 stage layout but occupy E1-EX_n for additional cycles.
+- The Ready Table is updated on the clock edge at W1 (D2 dispatch to W1 = 8 cycles). A renamed ptag is cleared from Ready Table at W1, and set again on the CDB writeback cycle.
 
-### 4.3 Branch misprediction penalty
+### 4.5 Branch Misprediction Penalty (BCC Scalar Pipeline)
 
-| Step | v1 | v2 |
-|------|----|----|
+| Step | v1 | v2 BCC |
+|------|----|--------|
 | Detection (EX1) | 1 cy | 1 cy |
-| Recovery (RAT flash-restore + flush + redirect) | 1 cy | 1 cy |
-| **+ SSB / STQ flush** | — | concurrent with RAT restore (§11.4.4) |
+| MapQ reverse replay + SMAP <- CMAP | -- | 1 cy (parallel with flush) |
+| RAT flash-restore (CMAP snapshot) | 1 cy | 1 cy |
+| SSB / STQ flush | -- | concurrent with RAT restore |
+| Ready Table reset | -- | concurrent (mask=ALL_ONES) |
+| Physical IQ CAM-clear | -- | concurrent (branch_tag match) |
 | Front-end refill | ~6 cy | ~6 cy |
-| **Total mispredict penalty** | **6 cy** | **6 cy** (unchanged) |
+| **Total mispredict penalty** | **6 cy** | **6-7 cy** |
 
-The SSB / STQ flush runs in parallel with the RAT flash-restore: both are mask-clear operations on small CAMs, single-cycle.
+The MapQ replay and Ready Table reset run in parallel with the RAT restore and branch-tag CAM-clear -- all within the single recovery cycle.
 
 ---
 
@@ -753,334 +800,440 @@ The compiler may set the conditional-branch funct3's `H` bit (1 = predict taken 
 
 ## 6. Decode & Rename
 
-> **(v1 → v2: 子节 6.A / 6.B 完整复制自 v1 §6.1 / §6.2,内容未变更。v2 增量为 §6.1 Tile Metadata RAT、§6.2 Branch-tag stamping、§6.3 Checkpoint extensions。)**
+> **BCC scalar pipeline change: §6.A–§6.F replace the v1/v2 scalar RAT with the three-table model. §6.E (Tile RAT) and §6.F (Tile Metadata RAT) are unchanged from v2.**
 
-### 6.A Decode Stage (D1) — (v1 §6.1, 未变更)
+### 6.A Decode Stage (D1)
 
-The decode stage processes **4 instructions per cycle**, identifying each instruction's domain, opcode, source/destination registers, and immediate values.
+D1 processes **4 instructions per cycle**, allocating a **Rename ID (RID, 6-bit)** per instruction and resolving the architectural register indices (atag) for each source operand.
 
 | Function | Detail |
 |----------|--------|
 | Decode width | **4** instructions / cycle |
-| Domain classification | Opcode[6:5] → scalar, vector, cube, MTE |
+| RID allocation | Unique 6-bit program-order ID per decoded instruction |
+| Domain classification | Opcode[6:5] -> scalar, vector, cube, MTE |
+| atag resolution | Source atag: architectural register index (0-31 for GPRs) |
+| Operand classification | `pclass`: P=GPR (32 regs), T=tile (32 regs), U=uncore, CARG=compile-time arg |
 | Immediate extraction | Sign-extend and format-dependent extraction |
-| Branch detection | Identify branch instructions for checkpoint allocation |
+| Branch detection | Identify branch instructions for branch_tag allocation |
 
-Instructions that cannot be expressed as a single micro-op (e.g., certain complex addressing modes) are **cracked** into 2 micro-ops at D1, consuming 2 dispatch slots.
+**D1 output uop format:**
 
-### 6.B Rename Stage (D2) — (v1 §6.2, 未变更)
+| Field | Width | Description |
+|-------|-------|-------------|
+| `valid` | 1 b | Fetch bundle slot valid |
+| `pc` | 64 b | Instruction PC |
+| `opcode` | 12 b | Operation code |
+| `src[i].atag` | 6 b | Source i architectural register index |
+| `src[i].pclass` | 2 b | P=0, T=1, U=2, CARG=3 |
+| `dst.atag` | 6 b | Destination architectural register index |
+| `dst.pclass` | 2 b | Destination operand class |
+| `rid` | 6 b | Rename ID (program order; used for age-based issue pick) |
+| `checkpoint_id` | 4 b | MapQ entry ID (for flush recovery) |
+| `imm` | 64 b | Immediate value |
 
-The rename stage performs **register renaming** for both scalar registers and tile registers using two independent Register Alias Tables (RATs). The Scalar RAT maps 32 architectural GPRs to 128 physical GPRs. The Tile RAT maps 32 architectural tile registers to 256 physical tile slots in TRegFile-4K.
+### 6.B Rename Pipeline: D1 -> D2 -> D3
 
-#### 6.B.1 Scalar RAT (v1 §6.2.1)
+#### 6.B.1 D2: Rename Request
+
+D2 performs register renaming in a single cycle, operating on the D1 output bundle in program order (slot 0 first, slot 3 last). Within a bundle, later slots can bypass the newly allocated ptag of earlier slots.
+
+**P-register (GPR) rename:**
+
+```
+# Per D2 slot (processed in program order; smap_live accumulates updates):
+smap_live = SMAP.copy()   # initial state from SMAP
+
+for slot in range(4):
+    u = d1_uop[slot]
+    if not u.valid: continue
+
+    # Step 1: Resolve source ptag from SMAP (live state)
+    if u.src[0].pclass == P:
+        src0_ptag = smap_live[u.src[0].atag]   # SMAP lookup or bypass from earlier slot
+    # ... same for src[1], src[2]
+
+    # Step 2: Allocate new ptag for P-destination
+    if u.dst.pclass == P and u.dst.atag != 0:   # atag=0 is r0 (hardwired zero)
+        old_ptag = smap_live[u.dst.atag]        # will become orphan
+        new_ptag = allocate_from_free_list(free_list)  # lowest-numbered free ptag
+
+        # Update SMAP (live for later slots in same group)
+        smap_live[u.dst.atag] = new_ptag
+
+        # Update refcount
+        refcount[old_ptag] -= 1
+        refcount[new_ptag] += 1
+        if refcount[old_ptag] == 0:
+            free_list.push(old_ptag)   # orphan freed immediately
+
+        # Push MapQ entry (for flush recovery)
+        mapq.push(MapQEntry {
+            valid: 1,
+            atag: u.dst.atag,
+            old_ptag: old_ptag,
+            new_ptag: new_ptag,
+            rid: u.rid,
+            is_push_t: 0,
+            is_push_u: 0
+        })
+```
+
+**Intra-group bypass**: If a source atag matches a destination atag allocated in an earlier slot of the same group, the ptag is forwarded directly from `smap_live` without an SMAP lookup. Comparator cost: 3 sources x 3 earlier slots x 6-bit = 54 comparators.
+
+**T/U operands**: Handled by the Tile RAT independently (unchanged from v2).
+
+**D2 uop output** (carried to D3 in a pipeline register):
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `src0_ptag` | 7 b | Resolved source ptag 0 |
+| `src1_ptag` | 7 b | Resolved source ptag 1 |
+| `src2_ptag` | 7 b | Resolved source ptag 2 (immediate/pc-rel) |
+| `pdst` | 7 b | Newly allocated destination ptag |
+| `dst_atag` | 6 b | Destination atag (for MapQ entry) |
+| `dst_class` | 2 b | P / T / U |
+| `has_dst` | 1 b | Whether this uop writes a register |
+| `src_ready` | 3 b | Ready Table init: {src0_rdy, src1_rdy, src2_rdy} from Ready Table query |
+
+#### 6.B.2 D3: Rename Complete + Dispatch Prep
+
+D3 is the **rename-complete boundary**. It finalizes the SMAP write and initializes the Ready Table state for each dispatched instruction:
+
+```
+# D3: finalize SMAP write
+SMAP = smap_live   # atomic write of live state to SMAP
+
+# Initialize Ready Table for each dispatched entry
+for slot in range(4):
+    u = d3_uop[slot]
+    if u.dst_class == P and u.has_dst:
+        # Clear the newly allocated ptag from Ready Table
+        # (not ready until CDB writeback)
+        ready_table.clear(u.pdst)
+
+    # Source ready bits were pre-computed from Ready Table query in D2
+    # (combinational; registered into IQ entry at S2)
+```
+
+D3 also assigns IQ routing:
+
+| Op type | Target IQ | Issue width |
+|---------|---------|-------------|
+| ALU (ADD/SUB/AND/OR/XOR/SLT/SLL/SRL/SRA/MUL) | `alu_iq` | 4-wide |
+| FSU (floating-point scalar ops) | `alu_iq` | 4-wide |
+| BRU (branch/jump) | `bru_iq` | 1-wide |
+| LSU (load/store) | `lsu_iq` | 2-wide |
+
+#### 6.B.3 Rename Register State Machine
+
+Three parallel structures manage P-reg rename:
+
+```
+CMAP [32 x 7b]:  atag -> committed ptag
+  - Updated when: ptag becomes orphan + refcount=0 (freed)
+  - Flush target: SMAP <- CMAP (full restore)
+
+SMAP [32 x 7b]:  atag -> speculative ptag (active rename view)
+  - Updated on each D2 group (in program order)
+  - Flush: SMAP <- CMAP via MapQ reverse replay
+
+MapQ [12-entry ring buffer]:
+  Fields: {atag, old_ptag, new_ptag, rid, is_push_t, is_push_u}
+  - D2: push entry for each P-dst rename
+  - Flush: reverse replay from tail to head until rid > flush_rid
+  - Undo per entry: SMAP[atag] <- old_ptag; refcount[new_ptag]--; refcount[old_ptag]++
+  - After replay: SMAP == CMAP (exact committed state)
+```
+
+#### 6.B.4 Checkpoint Extensions (BCC Scalar Pipeline)
+
+RAT checkpoints are replaced by MapQ for P-reg rename recovery. The branch-tag allocator and SSB/STQ head-pointer snapshot remain unchanged from v2.
+
+| Component | v2 (RAT checkpoints) | BCC (MapQ) |
+|-----------|---------------------|------------|
+| P-reg recovery | 8 x 224-bit RAT snapshots | 12-entry incremental MapQ |
+| T-reg recovery | 8 x 256-bit Tile RAT snapshots | Unchanged (Tile RAT independent) |
+| Flush precision | Checkpoint at branch time | Instruction-precise via rid cut |
+| SSB/STQ recovery | Head pointer snapshot | Unchanged |
+
+### 6.C Free Lists
 
 | Parameter | Value |
 |-----------|-------|
-| Architectural registers | 32 (X0–X31) |
-| Physical registers | **128** (P0–P127) |
-| RAT storage | 32 entries × 7 bits = **224 bits** |
-| Read ports | **8** (2 sources × 4 decode slots) |
-| Write ports | **4** (1 destination × 4 decode slots) |
+| **Scalar free list** | FIFO, 96 entries (128 ptags minus 32 atags) |
+| Scalar dequeue rate | up to 4 per cycle (P-destinations at D2) |
+| Scalar enqueue rate | up to 4 per cycle (orphan + refcount=0) |
+| **Tile free list** | FIFO, 224 entries (256 ptags minus 32 atags) — unchanged |
 
-Each RAT entry contains:
-- Physical register index (7 bits)
-- Ready bit (1 bit): set when result has been written to the physical RF
+**Stall condition**: If the free list cannot supply enough ptags for the current D2 group, the rename pipeline stalls at D1.
 
-#### 6.B.2 Tile RAT (Vector, Cube, MTE Operands) — (v1 §6.2.2)
+### 6.D Intra-Group Bypass Logic
 
-All three tile-consuming domains (vector, cube, MTE) share a single **Tile RAT** that renames 32 architectural tile registers (T0–T31) to 256 physical tile slots (PT0–PT255) in TRegFile-4K. This eliminates WAW and WAR hazards on tile operands through renaming, exactly as the scalar RAT does for GPRs.
-
-| Parameter | Value |
-|-----------|-------|
-| Architectural tile registers | 32 (T0–T31) |
-| Physical tile registers | **256** (PT0–PT255), 4 KB each in TRegFile-4K |
-| Tile RAT storage | 32 entries × 8 bits = **256 bits** |
-| Read ports | **8** (up to 3 source tiles × 4 decode slots, shared/muxed) |
-| Write ports | **4** (1 destination tile × 4 decode slots) |
-
-Each Tile RAT entry contains:
-- Physical tile index (8 bits)
-- Ready bit (1 bit): set when the producing operation has finished writing the physical tile
-
-Tile RAT operation mirrors scalar RAT operation: at D2, destination tile operands are allocated a fresh physical tile from the tile free list, the old physical tile mapping is marked orphan, and source tile operands are looked up to obtain the current physical tile index and ready bit. Tile instructions dispatched to Vector RS, Cube RS, and MTE RS carry **physical tile tags** (8 bits each) rather than architectural indices.
-
-#### 6.B.3 Intra-Group Bypass Logic (v1 §6.2.3)
-
-When 4 instructions are renamed simultaneously, later instructions in the group may depend on earlier ones. Hardware **priority-encoded comparators** detect these intra-group dependencies for both scalar and tile RATs:
+When 4 instructions are renamed simultaneously, later instructions in the group may depend on earlier ones. Hardware **priority-encoded comparators** detect these intra-group dependencies:
 
 ```
   Scalar example:
-    Rename slot 0:  X5 → P40  (destination)
-    Rename slot 1:  reads X5  → comparator detects match → bypass P40
-    Rename slot 2:  X5 → P41  (re-definition)
-    Rename slot 3:  reads X5  → comparator detects slot 2 match → bypass P41
+    D2 slot 0:  X5 -> P40  (destination)
+    D2 slot 1:  reads X5  -> comparator detects match -> bypass P40
+    D2 slot 2:  X5 -> P41  (re-definition)
+    D2 slot 3:  reads X5  -> comparator detects slot 2 match -> bypass P41
 
-    4 slots × 2 sources × 3 older slots = 24 comparators (7-bit each)
-    + 8 bypass MUXes (select forwarded phys-reg vs scalar RAT read)
+    4 slots x 2 sources x 3 older slots = 24 comparators (7-bit each)
+    + 8 bypass MUXes (select forwarded ptag vs SMAP read)
 
-  Tile example:
-    Rename slot 0:  TILE.LD T10  → PT200  (destination)
-    Rename slot 1:  VADD dst=T10 → PT201  (re-definition)
-    Rename slot 2:  reads T10    → comparator detects slot 1 match → bypass PT201
+  Tile example (unchanged from v2):
+    D2 slot 0:  TILE.LD T10  -> PT200  (destination)
+    D2 slot 1:  VADD dst=T10 -> PT201  (re-definition)
+    D2 slot 2:  reads T10    -> comparator detects slot 1 match -> bypass PT201
 
-    4 slots × 3 tile sources × 3 older slots = 36 comparators (8-bit each)
-    + 12 bypass MUXes (select forwarded phys-tile vs Tile RAT read)
+    4 slots x 3 tile sources x 3 older slots = 36 comparators (8-bit each)
+    + 12 bypass MUXes
 ```
 
-#### 6.B.4 Free Lists (v1 §6.2.4)
+### 6.E Tile RAT — unchanged from v2 (SS6.2)
+
+All tile-consuming domains (vector, cube, MTE) share a single **Tile RAT** that renames 32 architectural tile registers (T0-T31) to 256 physical tile slots (PT0-PT255) in TRegFile-4K. The Tile RAT is **independent** of the P-reg rename pipeline (SMAP/CMAP/MapQ) and is **unchanged** from v2.
 
 | Parameter | Value |
 |-----------|-------|
-| **Scalar free list** | FIFO, 96 entries (128 physical − 32 architectural) |
-| Scalar dequeue rate | up to 4 per cycle |
-| Scalar enqueue rate | up to 4 per cycle (from ref-count freeing) |
-| **Tile free list** | FIFO, 224 entries (256 physical − 32 architectural) |
-| Tile dequeue rate | up to 4 per cycle |
-| Tile enqueue rate | up to 4 per cycle (from tile ref-count freeing) |
+| Architectural tile registers | 32 (T0-T31) |
+| Physical tile registers | **256** (PT0-PT255), 4 KB each in TRegFile-4K |
+| Tile RAT storage | 32 entries x 8 bits = **256 bits** |
+| Read ports | **8** (up to 3 source tiles x 4 decode slots, shared/muxed) |
+| Write ports | **4** (1 destination tile x 4 decode slots) |
 
-At reset, the scalar free list is initialized with P32–P127 (first 32 pre-assigned to X0–X31). The tile free list is initialized with PT32–PT255 (first 32 pre-assigned to T0–T31).
+### 6.F Tile Metadata RAT — unchanged from v2 (SS6.1)
 
-**Stall condition:** If either free list cannot supply enough physical registers for the current decode group, the rename stage stalls the pipeline.
-
-#### 6.B.5 Checkpoint Storage (Branch Recovery) — (v1 §6.2.5, 在 v2 §6.3 中扩展)
-
-| Parameter | Value (v1 baseline) |
-|-----------|---------------------|
-| Checkpoint slots | **8** (supports 8 in-flight unresolved branches) |
-| Checkpoint size (v1) | Scalar RAT (224b) + Tile RAT (256b) + scalar free-list head (7b) + tile free-list head (8b) + RAS pointer (4b) = **~499 bits** |
-| Flash-copy latency | **1 cycle** (parallel bit-copy from both active RATs) |
-| Flash-restore latency | **1 cycle** (parallel bit-copy to both active RATs) |
-
-Both the Scalar RAT and Tile RAT are checkpointed. On branch misprediction, both RATs are restored in parallel, along with both free-list head pointers.
-
-**Checkpoint lifecycle (v1 baseline):**
-
-```
-  Branch decoded at D2:
-    1. Allocate checkpoint slot (round-robin)
-    2. Flash-copy: active Scalar RAT + active Tile RAT → checkpoint[i]
-    3. Save scalar free-list head, tile free-list head, and RAS top pointer
-    4. Tag the branch's RS entry with checkpoint ID
-
-  Branch resolved correctly at EX1:
-    1. Deallocate checkpoint slot → available for reuse
-
-  Branch mispredicted at EX1:
-    1. Flash-restore: checkpoint[i] → active Scalar RAT + active Tile RAT
-    2. Restore scalar free-list head pointer (reclaim speculatively allocated GPRs)
-    3. Restore tile free-list head pointer (reclaim speculatively allocated tiles)
-    4. Restore RAS pointer
-    5. Flush all pipeline stages after D2
-    6. Redirect fetch to correct target
-```
-
-**Stall condition:** If all 8 checkpoint slots are occupied, the rename stage stalls on the next branch instruction until an older branch resolves.
-
----
-
-### 6.1 Tile Metadata RAT (v2 增量)
-
-A new **32 b × 256 entry** SRAM stores the metadata word for each physical tile. Access pattern:
-
-| Event | Action |
-|-------|--------|
-| Physical tile allocated (D2 of a producer instruction) | Reset metadata to "uninitialized" sentinel |
-| Producer retires | Producer writes metadata word (alongside its 4 KB payload) |
-| Consumer reads tile | Consumer reads metadata word from the **first strip**'s arrival at staging (§8.3.3) |
-
-The Tile Metadata RAT is read at D2 alongside the regular Tile RAT lookup; the metadata word is forwarded to the consumer's VEC RS entry (`SOP` staging at issue, [`vector4k_v2.md`](vector4k_v2.md) §4.4).
-
-`TSETMETA` writes the metadata RAT directly at D2, with no execute stage.
-
-**Storage:** 256 × 32 b = 1024 B = ~10 K gate. Read ports: 4 (one per decode slot) + 1 (TCB completion). Write ports: 2 (1 at retire, 1 for `TSETMETA`).
-
-### 6.2 Branch-tag stamping (v2 增量)
-
-Every µop entering the rename stage receives the **current** branch_tag (the tag of the youngest unresolved branch ahead of it; or `0xFF` if none). Storing this tag on the µop's RS entry (3 b) lets the misprediction recovery logic identify which entries to flush in one cycle.
-
-### 6.3 Checkpoint extensions (v2 增量)
-
-The 8 RAT-checkpoint slots are extended to also snapshot:
-
-- SSB head pointer (5 b).
-- STQ head pointer (4 b).
-- Tile Metadata RAT delta-vector (4 b "tags last touched" — the metadata RAT itself doesn't need full snapshot because metadata writes are tied to retire, not rename; only the *delta-tag* needs replay).
-
-Updated checkpoint size:
-
-| Field | v1 | v2 |
-|-------|----|----|
-| Scalar RAT | 224 b | 224 b |
-| Tile RAT | 256 b | 256 b |
-| Scalar free-list head | 7 b | 7 b |
-| Tile free-list head | 8 b | 8 b |
-| RAS top pointer | 4 b | 4 b |
-| **SSB head pointer** | — | 5 b |
-| **STQ head pointer** | — | 4 b |
-| **Metadata-delta tag** | — | 4 b |
-| **Per-checkpoint total** | ~499 b | **~512 b** |
-
-8 slots × 512 b = **4 KB checkpoint store** (negligible vs. the 1 MB TRegFile). Flash-restore latency stays at **1 cycle**.
+A **256 x 32 b SRAM** stores the metadata word `(shape.x, shape.y, format)` per physical tile. Access pattern unchanged from v2 SS6.1.
 
 ---
 
 ## 7. Dispatch & Issue
 
-### 7.1 Dispatch (DS)
+### 7.1 Dispatch (S1 / S2)
 
-> **(v1 → v2: §7.1 整体语义未变,仅 Vector RS 容量从 16 → 24,理由见下表。其余 RS 容量与分发流程完整继承自 v1 §7.1。)**
+After rename (D1->D2->D3), each uop is dispatched through the **S1 / S2** two-stage dispatch.
 
-After rename, each µop dispatches into the appropriate RS based on its domain and operation type. Dispatch is **in-order** (preserving program order for dependency tracking), but issue from reservation stations is **out-of-order**. Each µop carries its `branch_tag` (3 b) into the RS entry alongside the v1 fields.
+**S1 -- Dispatch Preparation**: Checks resource availability before writing IQ entries.
 
-| Reservation Station | Serves | v1 entries | v2 entries | Issue width | Sizing rationale |
-|---------------------|--------|------------|------------|-------------|------------------|
-| **Scalar RS** | 4× ALU, 1× MUL/DIV, 1× BRU | **32** | **32** | 6 (4 ALU + 1 MUL + 1 BRU) | unchanged |
-| **LSU RS** | Load unit, Store unit | **24** | **24** | 2 (1 load + 1 store) | unchanged |
-| **Vector RS** | VEC-4K-v2 ALU/FMA/PTO | **16** | **24** | 1 | VEC-4K-v2 entries are wider (3 source tile tags + 2 dest + mask flag + xpose flags + retire mask + scalar staging tags) and multi-cycle ops occupy slots longer (`TINV` up to 33 K beats; `TMRGSORT` up to 2 912 beats — fewer in number than elementwise ops, but their long execute time means the RS must absorb more dispatched ops without stalling the front-end). |
-| **Cube RS** | CUBE.OPA, CUBE.CFG, CUBE.DRAIN, CUBE.ZERO, CUBE.WAIT | **4** | **4** | 1 | unchanged |
-| **MTE RS** | TILE.LD/ST/GATHER/SCATTER/GET/PUT/COPY/TRANSPOSE | **16** | **16** | 2 | unchanged |
-| **Total** | — | **92** | **100** | — | +8 vector RS entries |
+**S2 -- Dispatch Execute**: Writes IQ entries and updates free lists.
 
-#### 7.1.1 Reservation Station Sizing Rationale (v1 §7.1.1, 未变更 except Vector RS as noted)
+**S1 resource checks:**
 
-> **(v1 → v2: 以下 5 个子段中 4 个完整复制自 v1 §7.1.1。Vector RS 子段更新以反映 v2 容量提升至 24。)**
+| Check | Condition | Recovery |
+|-------|-----------|----------|
+| Scalar free list | `free_mask` has >= N free ptags for dispatched P-dst ops | Stall at D1 |
+| MapQ space | `mapq.count < 11` (keep 1 slot safety margin) | Stall at D1 |
+| `alu_iq` space | >= N alu-class slots in current dispatch group | Stall at S1 |
+| `bru_iq` space | >= N bru-class slots in current dispatch group | Stall at S1 |
+| `lsu_iq` space | >= N lsu-class slots in current dispatch group | Stall at S1 |
+| Tile free list | >= N free tile ptags | Stall at D1 |
 
-The number of entries in each RS is chosen to satisfy: **(1)** absorb the execution latency of its functional units so that new instructions are not stalled waiting for RS slots, **(2)** provide enough window for out-of-order issue to find independent instructions, and **(3)** stay within area and wakeup-logic power budgets. The core principle: RS entries ≈ **dispatch rate × average occupancy time**, with headroom for dependent chains and dispatch bursts.
+**IQ routing (from D3 assignment):**
 
-**Scalar RS — 32 entries (v1, 未变更):**
-- The front-end dispatches up to **4 instructions/cycle**. In typical AI/HPC kernels, ~60–70% of instructions are scalar (address computation, loop control, branch), giving ~2.5–3 scalar dispatches/cycle.
-- ALU latency is **1 cycle** (result available next cycle), so independent ALU chains drain quickly. However, **MUL (4 cy)** and **DIV (12–20 cy)** are multi-cycle and block their pipeline slot while in-flight. A single DIV can occupy an issue port for up to 20 cycles.
-- With 6 issue ports, up to 6 instructions leave the RS per cycle, but dependent chains create bubbles. The RS needs enough depth to look past these stalls and find independent operations.
-- Sizing: ~3 dispatch/cy × ~8 cy average occupancy (mix of 1-cy ALU and 4-cy MUL, with occasional 20-cy DIV) ≈ 24 entries minimum. Rounded up to **32** to tolerate bursty dispatch and long DIV chains.
-- Wakeup cost: 32 entries × 2 sources × 6 CDB ports = **384 tag comparators** (7-bit each) — acceptable at 5 nm.
+| Op type | Target IQ | Issue width |
+|---------|---------|-------------|
+| ALU (ADD/SUB/AND/OR/XOR/SLT/SLL/SRL/SRA/MUL) | `alu_iq` | 4-wide |
+| FSU (floating-point scalar ops) | `alu_iq` | 4-wide |
+| BRU (branch/jump) | `bru_iq` | 1-wide |
+| LSU (load/store) | `lsu_iq` | 2-wide |
+| Vector ops | Vector RS | 1-wide |
+| Cube ops | Cube RS | 1-wide |
+| MTE ops | MTE RS | 2-wide |
 
-**LSU RS — 24 entries (v1, 未变更):**
-- Load/store instructions make up ~20–30% of a typical mix, so ~0.8–1.2 dispatches/cycle.
-- **Load latency is 4 cycles** (L1 hit) but **12+ cycles** on L1 miss (L2 hit), and hundreds of cycles on DRAM access. The LSU RS must buffer many outstanding loads to exploit **memory-level parallelism (MLP)**.
-- The L1-D cache supports **8 MSHRs** (miss-status holding registers) — up to 8 cache misses can be in flight simultaneously, each occupying an RS slot for 12+ cycles.
-- Sizing: 8 MSHR-bound loads (occupying slots for ~12 cy each) + steady-state L1-hit loads and stores ≈ **24 entries**. This keeps the memory subsystem saturated with overlapping misses while allowing hit-path traffic to proceed without stalling dispatch.
-- The 2-port issue (1 load + 1 store/cycle) prevents store traffic from blocking load throughput.
-- **(v2 增量, §11.4)**: Each LSU RS entry now carries an additional 5-bit `ssb` field pointing into the Speculative Store Buffer for stores; pure loads leave it unused.
-
-**Vector RS — 24 entries (v2 update from v1's 16):**
-- Vector instructions have **high latency** (16 cycles for elementwise; up to 33 K beats for `TINV`; up to 2 912 beats for `TMRGSORT`) with epoch-pipelined throughput of **1 tile per 8 cycles** for elementwise ops. They are less frequent than scalar ops but arrive in bursts during vector-heavy code regions.
-- v2 RS entries are **wider** than v1: 3 source tile tags (was 2) + 2 destination tile tags (was 1) + mask-flag + 3 per-operand xpose bits + retire-mask + scalar staging tags. Each tile-domain entry is ~92 b (was ~80 b).
-- v2 also adds long multi-cycle PTO ops (`TINV`, `TROWRANGE_MUL`, `TMRGSORT`) that can occupy an RS slot for thousands of beats; the RS must absorb additional dispatched ops without stalling the front-end during these long ops.
-- Sizing: v1's 16 entries → v2's **24 entries** (+8 entries, +50%).
-- Tile-domain RS entries don't capture 4 KB tile data: only 8-bit tags + ready bits, so 24 entries ≈ **276 bytes**.
-
-**Cube RS — 4 entries (v1, 未变更):**
-- Cube instructions are **very long-latency** (CUBE.OPA: N+18 cycles, typically 26–82 cy) but **extremely infrequent** — a single CUBE.OPA encodes an entire K-loop of outer-product-accumulate steps spanning thousands of MAC operations.
-- A typical GEMM kernel issues 1 CUBE.OPA per ~100+ scalar/MTE instructions. Software double-buffers tile loads around cube execution, so the cube RS is rarely the dispatch bottleneck.
-- The RS only needs to hold: the currently-executing CUBE.OPA, the next queued CUBE.OPA (overlapping with tile loads for the next iteration), plus associated CUBE.CFG/CUBE.DRAIN/CUBE.WAIT control instructions.
-- Sizing: **4 entries** suffices because the instruction stream rarely has >2–3 cube instructions queued. Additional entries would waste area (including 8-bit tile tag comparators) with no throughput benefit since the cube pipeline executes 1 instruction at a time.
-
-**MTE RS — 16 entries (v1, 未变更):**
-- MTE instructions span a wide latency range: **TILE.LD: 72 cy** (L2 hit, potentially hundreds from DRAM), **TILE.ST: 72 cy**, **TILE.COPY/TRANSPOSE: 16 cy**, **TILE.ZERO: 8 cy**, **TILE.GET: 9 cy**.
-- The primary design driver is **memory-level parallelism for tile loads**: the programmer (or compiler) schedules many TILE.LD instructions ahead of the CUBE.OPA that consumes the loaded tiles. With up to **7 available write ports** and a **32-entry outstanding request buffer**, the MTE can service many concurrent tile loads.
-- At 2 issues/cycle, the MTE RS can launch 2 tile operations per cycle (e.g., 1 TILE.LD + 1 TILE.ST on separate ports).
-- Sizing: 7 concurrent TILE.LDs (one per write port) + several TILE.STs and local tile ops (GET/PUT/COPY/TRANSPOSE) + headroom for dispatch bursts ≈ **16 entries**. This provides enough scheduling window to overlap tile loads with stores and local operations, maximizing TRegFile-4K port utilization.
-- **(v2 增量, §11.5)**: Each MTE RS entry for `TILE.ST`/`TILE.SCATTER` now carries an additional 4-bit `stq` field pointing into the Speculative Tile-Store Queue.
-
-**Summary — entries vs. area (v2):**
-
-| RS | Entries | Entry width (v2) | Storage | Comparators | Dominant sizing factor |
-|----|---------|-----------------|---------|-------------|----------------------|
-| Scalar | 32 | ~178 b (+8 b btag/ssb) | ~712 B | 384 (7b × 6 CDB) | Multi-cycle MUL/DIV latency + DIV blocking |
-| LSU | 24 | ~178 b | ~534 B | 288 (7b × 6 CDB) | L1 miss latency (MLP) + 8 MSHRs + SSB |
-| Vector | **24** | **~92 b** | **~276 B** | 288 (8b × 4 TCB × 3 srcs) | 16-cy epoch latency + multi-cycle PTOs + dispatch bursts |
-| Cube | 4 | ~92 b | ~46 B | 16 (8b × 4 TCB) | Infrequent instructions, 1 in-flight |
-| MTE | 16 | ~92 b | ~184 B | 64 (8b × 4 TCB) + 96 (7b × 6 CDB) | TILE.LD MLP + 7 write ports + STQ |
-| **Total** | **100** | — | **~1752 B** | **~1136** | |
-
-### 7.2 Reservation Station Entry Format
-
-**Scalar / LSU RS entry (v2):**
+**S2 dispatch execute:**
 
 ```
- ┌─────────┬──────┬─────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┬───────┬─────┬─────┐
- │ valid   │ age  │ btag│ op   │ psrc1│ rdy1 │data1 │ psrc2│ rdy2 │data2 │ pdst  │ ckpt│ ssb │
- │ (1b)    │ (6b) │(3b) │(8b)  │(7b)  │(1b)  │(64b) │(7b)  │(1b)  │(64b) │ (7b)  │(3b) │(5b) │
- └─────────┴──────┴─────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┴───────┴─────┴─────┘
-   ~178 bits per scalar/LSU entry (v1: ~170; +8 b for branch_tag and SSB index)
+for slot in dispatched_slots:
+    iq_type = s1_iq_route[slot]
+    entry_idx = iq_alloc.allocate(iq_type)
+
+    iq[entry_idx].valid = 1
+    iq[entry_idx].src0_ptag = d3_uop[slot].src0_ptag
+    iq[entry_idx].src1_ptag = d3_uop[slot].src1_ptag
+    iq[entry_idx].src2_ptag = d3_uop[slot].src2_ptag
+    iq[entry_idx].pdst = d3_uop[slot].pdst
+    iq[entry_idx].src_ready = d3_uop[slot].src_ready
+    iq[entry_idx].rid = d3_uop[slot].rid
+    iq[entry_idx].lsid = d3_uop[slot].lsid
+    iq[entry_idx].checkpoint_id = d3_uop[slot].checkpoint_id
+    iq[entry_idx].branch_tag = current_branch_tag
+
+free_mask &= ~allocated_ptags
 ```
 
-**Tile-domain RS entry (v2 — Vector / Cube / MTE):**
+### 7.2 Physical IQ Entry Formats
+
+#### ALU IQ Entry (48 entries, ~95 bits each)
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `valid` | 1 b | Entry occupied |
+| `rid` | 6 b | Rename ID (program order, used for age) |
+| `op` | 12 b | Operation code |
+| `imm` | 64 b | Immediate value |
+| `src0_ptag` | 7 b | Source 0 ptag |
+| `src1_ptag` | 7 b | Source 1 ptag |
+| `src2_ptag` | 7 b | Source 2 ptag |
+| `pdst` | 7 b | Destination ptag |
+| `has_dst` | 1 b | Whether this uop writes a register |
+| `src_ready` | 3 b | Ready bits: {src0_rdy, src1_rdy, src2_rdy} |
+| `checkpoint_id` | 4 b | MapQ entry ID |
+| `branch_tag` | 3 b | Speculation branch tag |
+
+**Total: 48 x ~95 b approx 570 B**
+
+#### BRU IQ Entry (16 entries, ~120 bits each)
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `valid` | 1 b | Entry occupied |
+| `rid` | 6 b | Rename ID (program order) |
+| `op` | 12 b | Operation code |
+| `pc` | 64 b | Instruction PC |
+| `src0_ptag` | 7 b | Source 0 ptag |
+| `src1_ptag` | 7 b | Source 1 ptag |
+| `pdst` | 7 b | Destination ptag (branch target register) |
+| `has_dst` | 1 b | Whether this uop writes a register |
+| `src_ready` | 2 b | Ready bits: {src0_rdy, src1_rdy} |
+| `checkpoint_id` | 4 b | MapQ entry ID |
+| `branch_tag` | 3 b | Speculation branch tag |
+| `pred_taken` | 1 b | Branch prediction direction |
+
+**Total: 16 x ~120 b approx 240 B**
+
+#### LSU IQ Entry (32 entries, ~104 bits each)
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `valid` | 1 b | Entry occupied |
+| `rid` | 6 b | Rename ID (program order) |
+| `op` | 12 b | Operation code |
+| `lsid` | 32 b | Load-Store ID |
+| `src0_ptag` | 7 b | Base register ptag |
+| `src1_ptag` | 7 b | Offset register ptag |
+| `pdst` | 7 b | Destination ptag |
+| `has_dst` | 1 b | Whether this uop writes a register |
+| `src_ready` | 2 b | Ready bits: {src0_rdy, src1_rdy} |
+| `checkpoint_id` | 4 b | MapQ entry ID |
+| `branch_tag` | 3 b | Speculation branch tag |
+| `addr_ready` | 1 b | AGU address computation complete |
+
+**Total: 32 x ~104 b approx 416 B**
+
+**Key difference from v1 RS entries**: No per-entry `age` field -- age is encoded in the `rid` (6-bit Rename ID, program order). No per-entry `rdy1`/`rdy2` ready bits -- ready state is maintained in the **Ready Table** and checked at issue time.
+
+### 7.3 Ready Table
+
+The Ready Table is a **128-bit bitmap** that tracks which ptags have valid values. It replaces the `O(iq_depth x issue_w x pregs)` CDB comparator array with `O(1)` bit-tests.
 
 ```
- ┌──────┬──────┬─────┬──────┬───────┬──────┬───────┬──────┬───────┬──────┬───────┬──────┬───────┬─────┬─────┬──────┐
- │valid │ age  │ btag│ op   │ptsrc1 │trdy1 │ptsrc2 │trdy2 │ptsrc3 │trdy3 │ptdst1 │ptdst2│pscalar│ ckpt│ stq │meta_v│
- │(1b)  │(6b)  │(3b) │(8b)  │ (8b)  │(1b)  │ (8b)  │(1b)  │ (8b)  │(1b)  │ (8b)  │ (8b) │(8b)*  │(3b) │(4b) │(1b)  │
- │      │      │     │      │ +xp   │      │ +xp   │      │ +xp   │      │       │      │       │     │     │      │
- │      │      │     │      │ (1b)  │      │ (1b)  │      │ (1b)  │      │       │      │       │     │     │      │
- └──────┴──────┴─────┴──────┴───────┴──────┴───────┴──────┴───────┴──────┴───────┴──────┴───────┴─────┴─────┴──────┘
-   ~92 bits per tile-domain entry (v1: ~80)
-   (* pscalar field is double-wide: 7 b GPR tag + 1 b GPR-vs-IMM selector;
-    sized to carry up to 2 scalar GPR tags for VEC-4K-v2 SX/SY operands
-    encoded compactly in `pscalar` + immediate field of `op`)
+Ready Table: bit[i] = 1 means ptag i has a valid value
+
+set(ptag):    mask |= (1 << ptag)     # Called on CDB writeback
+clear(ptag):  mask &= ~(1 << ptag)    # Called on ptag allocation at D2
+is_ready(i):  return (mask >> i) & 1
+read(i):       return is_ready(i)       # Combinational read for can_issue
 ```
 
-New fields vs. v1:
+**Update rules per cycle:**
 
-| Field | Width | Purpose |
-|-------|-------|---------|
-| `btag` | 3 b | Branch tag of the youngest unresolved branch ahead of this µop. Used for one-cycle CAM-clear on mispredict. |
-| `ptsrc3 + xp` | 8+1 b | Third source tile (the `C` mask in VEC, or 3rd cube operand). xp = is_xpose forwarded to TRegFile. |
-| `xp_A`, `xp_B`, `xp_C` | 1 b each | Per-operand TRegFile-side `is_transpose` bits (forwarded to TRegFile read port at issue) |
-| `ptdst2` | 8 b | Second destination tile (for dual-retire ops like `TMRGSORT`, `TROWARGMAX`) |
-| `ssb` | 5 b | Speculative-Store-Buffer index (LSU stores only) |
-| `stq` | 4 b | Speculative Tile-Store Queue index (MTE bulk stores only) |
-| `meta_v` | 1 b | Metadata-valid flag (set when the producer's metadata write has propagated) |
+| Event | Action |
+|-------|--------|
+| D2 dispatch: ptag allocated | `ready.clear(pdst)` -- set bit=0 |
+| CDB writeback | `ready.set(wb.ptag)` -- set bit=1 |
+| Flush | `ready.mask <= ALL_ONES` -- conservative reset |
 
-### 7.3 Wakeup Logic
-
-> **(v1 → v2: CDB 端语义未变,完整复制 v1 §7.3 描述。TCB 端因 VEC-4K-v2 第三源操作数被加宽,vector RS 比较器数量翻倍。)**
-
-When an execution unit broadcasts a result on the **Common Data Bus (CDB)**, every reservation station entry compares its source tags against the CDB tag (v1 §7.3, 未变更):
+**Can_issue computation (P1, combinational):**
 
 ```
-  CDB broadcast: (tag=P40, data=0x1234)
-
-  For each RS entry:
-    if (psrc1 == P40 && !rdy1):  rdy1 ← 1;  data1 ← 0x1234
-    if (psrc2 == P40 && !rdy2):  rdy2 ← 1;  data2 ← 0x1234
-
-  Hardware: N entries × 2 sources × 7-bit comparators × C CDB ports
-  Scalar RS: 32 × 2 × 6 = 384 comparators (CDB has 6 write-back ports)
+for each IQ entry e:
+    src0_rdy = ready_table.read(e.src0_ptag)   # O(1) bit-test
+    src1_rdy = ready_table.read(e.src1_ptag)
+    src2_rdy = ready_table.read(e.src2_ptag)
+    e.can_issue = e.valid & src0_rdy & src1_rdy & src2_rdy
 ```
 
-An instruction becomes **ready to issue** when `rdy1 && rdy2` (both operands available).
+**Wakeup timing:**
 
-**TCB wakeup (v2 widened):** 4 TCB ports broadcast 8 b tile tags. Tile-domain RS entries compare against ptsrc1/ptsrc2/ptsrc3 (3 sources × 4 ports = 12 comparators per entry; for the v2 24-entry vector RS this is 288 comparators, vs. v1's 16-entry × 2-source × 4 = 128).
+| Cycle | Event |
+|-------|-------|
+| W1 | CDB broadcasts ptag P40 is ready |
+| W1 (end) | `ready_next = ready | {P40}` registered |
+| Clock edge | Ready Table Register <= ready_next |
+| N+1 P1 | `can_issue` recomputed with new Ready Table |
+| N+1 P1 | Age-matrix pick selects winners |
+| N+1 I1 | RF read-port arbitration |
+| N+2 I2 | Issue confirm; IQ entry deallocated |
 
-### 7.4 Select Logic
+**Total wakeup latency: 2 cycles** (Ready Table register -> can_issue -> pick -> RF read).
 
-> **(v1 → v2: 内容未变更,以下完整复制自 v1 §7.4。)**
+### 7.4 Age-Matrix Issue Picker
 
-Each functional unit's select logic picks the **oldest ready** instruction from its reservation station every cycle:
+The issue picker is **purely combinational logic** (no state). For each physical IQ, a cascaded priority encoder selects the oldest-ready entries.
+
+**Age encoding**: RID is a 6-bit program-order counter. Sub-head age:
+```
+age = (entry.rid - head_rid) mod 64
+```
+Smaller age = older instruction = higher priority. Mod-64 arithmetic handles wrap correctly.
+
+**Cascaded pick (alu_iq, 4-wide):**
 
 ```
-  Select priority: lowest age value among entries with (valid && rdy1 && rdy2)
-
-  Per cycle:
-    Scalar RS → select up to 4 ALU + 1 MUL + 1 BRU (6 instructions)
-    LSU RS    → select 1 load + 1 store
-    Vector RS → select 1 vector op
-    Cube RS   → select 1 cube op
-    MTE RS    → select up to 2 tile ops
+selected = []
+excluded = set()
+for lane in range(4):   # alu_w = 4
+    winner = None
+    best_age = 0x3F     # Max RID value = youngest
+    for entry in alu_iq.entries:
+        if entry not in excluded and entry.can_issue:
+            age = (entry.rid - head_rid) & 0x3F   # mod-64 wrap-friendly
+            if age < best_age:
+                best_age = age
+                winner = entry
+    if winner:
+        selected.append(winner)
+        excluded.add(winner)
+    else:
+        selected.append(None)   # Lane empty
 ```
 
-**Issue conflicts:** If multiple ready instructions target the same functional unit type and only one slot is available, the oldest wins. Younger instructions remain in the RS for the next cycle.
+**Per-IQ issue widths:**
 
-### 7.5 Dispatch Stall Conditions (v2 additions)
+| IQ | Issue width | Description |
+|----|-------------|-------------|
+| `alu_iq` | 4 | 4x ALU + FSU |
+| `bru_iq` | 1 | 1x BRU |
+| `lsu_iq` | 2 | 1x Load + 1x Store |
+| Vector RS | 1 | 1x VEC-4K-v2 op |
+| Cube RS | 1 | 1x outerCube op |
+| MTE RS | 2 | 2x MTE ops |
+
+### 7.5 Issue Stages: P1 / I1 / I2
+
+#### P1 -- Issue Pick
+
+The P1 stage performs the **Ready Table query and age-matrix cascaded pick** (described in SS7.3 and SS7.4). Results are registered at the end of P1.
+
+#### I1 -- Operand Read Planning
+
+The I1 stage arbitrates **physical RF read-port access** across all 7 issue slots (alu_iq x 4 + bru_iq x 1 + lsu_iq x 2). The scalar RF has 12 read ports (8 from rename + 4 from issue). Port conflicts are resolved by priority.
+
+#### I2 -- Issue Confirm
+
+The I2 stage **deallocates IQ entries** for the selected instructions and confirms RF read-port occupancy. The physical RF read operation itself begins in I2 (registered input to RF) with data available at the start of E1.
+
+### 7.6 Dispatch Stall Conditions
 
 | Condition | Recovery |
 |-----------|----------|
-| Target RS is full | Wait for RS entry to be freed |
-| Scalar / Tile free list empty | Wait for refcount-driven free |
-| All checkpoint / branch-tag slots occupied | Wait for an in-flight branch to resolve |
-| **SSB full** (LSU stores blocked) | Wait for SSB entry to drain (oldest non-speculative store commits) |
-| **STQ full** (MTE bulk stores blocked) | Wait for STQ entry to drain |
+| Target IQ is full | Wait for entry to be freed |
+| Scalar free list empty | Wait for refcount-driven free |
+| MapQ space exhausted | Wait for MapQ eviction on branch resolve |
+| All branch-tag slots occupied | Wait for an in-flight branch to resolve |
+| SSB full | Wait for SSB entry to drain |
+| STQ full | Wait for STQ entry to drain |
 
 ---
 
@@ -1750,49 +1903,47 @@ VEC-4K-v2 binding: **R0 (Port A, with `is_xpose_A`)**, **R4 (Port B, with `is_xp
 
 The Davinci-v2 core implements a **ROB-less out-of-order** execution model. Because the core does not need to maintain precise architectural state (no interrupts, no exceptions in run-to-completion kernels), it dispenses with the Reorder Buffer entirely. This section describes how instructions flow through the core and how correctness is maintained.
 
-### 10.1 Core Principles (v1 §10.1, 未变更; v2 增加第 6 条)
+### 10.1 Core Principles (BCC Scalar Pipeline)
 
 1. **OoO dispatch, OoO execution, OoO completion.** An instruction's result is committed to the physical register file as soon as execution completes. There is no in-order retirement stage.
-2. **False dependencies (WAW, WAR) eliminated by register renaming.** Both the Scalar RAT (32→128) and Tile RAT (32→256) — and the new v2 **Tile Metadata RAT** — assign each destination to a unique physical register/tile, so no instruction ever overwrites another's live data.
-3. **True dependencies (RAW) resolved by tag-based wakeup.** Scalar instructions wait for source tags on the CDB. Tile-domain instructions wait for Tile RAT ready bits signaling physical tile completion.
-4. **Branch recovery via RAT checkpoints.** On mispredict, both the Scalar RAT and Tile RAT are flash-restored in 1 cycle; all younger instructions are flushed.
-5. **Physical registers freed by reference counting.** No ROB means no retirement-based freeing; instead, a register (scalar or tile) is freed when it is both *orphaned* (no longer the current mapping for any architectural register) and its reference count reaches zero.
-6. **(v2 增量) Speculative memory side effects gated by branch tag.** Speculative scalar stores live in the SSB and speculative bulk tile stores live in the STQ until their `branch_tag` resolves to non-speculative. See §11.
-
-### 10.2 Instruction Lifecycle (v1 §10.2, 未变更)
+2. **False dependencies (WAW, WAR) eliminated by register renaming.** The SMAP (speculative map) maps each atag to a unique ptag, so no instruction ever overwrites another's live data. The Tile RAT (32->256) and Tile Metadata RAT are unchanged from v2.
+3. **True dependencies (RAW) resolved by Ready Table tag-based wakeup.** Instructions wait for source ptag readiness via the Ready Table bitmap (O(1) lookup per ptag). Tile-domain instructions wait for Tile RAT ready bits signaling physical tile completion.
+4. **Branch recovery via MapQ reverse replay.** On mispredict, the SMAP is restored to CMAP state by replaying MapQ entries in reverse order from the flush_rid. All younger instructions are flushed from physical IQs via branch_tag CAM-clear.
+5. **Physical registers freed by reference counting.** No ROB means no retirement-based freeing; instead, a ptag is freed when it is both *orphaned* (no longer mapped by SMAP) and its refcount reaches zero.
+6. **Ready Table provides O(1) ptag readiness.** The 128-bit Ready Table bitmap replaces the 384-entry CDB comparator array for scalar wakeup. Each ptag's readiness is a single bit-test.
+7. **Speculative memory side effects gated by branch tag.** Speculative scalar stores live in the SSB and speculative bulk tile stores live in the STQ until their `branch_tag` resolves to non-speculative. See Section 11.### 10.2 Instruction Lifecycle (BCC Scalar Pipeline)
 
 ```
   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐
-  │Fetch│──▶│Decode│──▶│Rename│──▶│ Disp│──▶│Issue│──▶│ Exec│──▶│  WB │
-  │ F1-2│   │  D1  │   │  D2  │   │ DS  │   │ IS  │   │EX1-n│   │     │
+  │Fetch│──>│Decode│──>│Rename│──>│ Disp│──>│Issue│──>│ Exec│──>│  WB │
+  │F0-F4│   │  D1  │   │D2  D3│   │ S1 S2│   │P1I1I2│  │E1-n│   │
   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘
                          │                                         │
-                    Allocate P-reg                          Write P-reg
-                    Update RAT                             Broadcast CDB
-                    Checkpoint (branch)                    Wakeup dependents
-                    Increment ref-counts                   Decrement ref-counts
-                                                           Free orphans (refcnt=0)
+                    D1: RID/atag                            W1: Ready Table
+                    D2: SMAP read + ptag alloc              update + CDB
+                    D3: SMAP write + RT init                  broadcast
+                    + MapQ push
 ```
 
-Detailed per-stage actions (v1 §10.2 + v2 增量 in italics):
+Detailed per-stage actions:
 
 | Stage | Actions |
 |-------|---------|
-| **Fetch (F1–F2)** | PC → I-cache + branch predictor; receive 4 instructions |
-| **Decode (D1)** | Decode opcode, identify domain, extract fields |
-| **Rename (D2)** | Read Scalar RAT / Tile RAT for sources (get physical tags + ready bits); allocate physical dest from appropriate free list; update RAT; increment ref-counts for source physical regs/tiles; if branch: allocate + flash-copy both RAT checkpoints. *(v2: also stamp branch_tag on µop; if branch, allocate branch_tag from 8-slot pool, snapshot SSB head + STQ head into checkpoint)*. |
-| **Dispatch (DS)** | Write entry into target RS with opcode, source tags, ready bits, dest tag. *(v2: include branch_tag; allocate SSB slot for stores, STQ slot for bulk tile stores)*. |
-| **Issue (IS)** | Select oldest ready entry; read physical RF for operands not yet captured |
-| **Execute (EX)** | Compute result (variable latency per unit). *(v2: scalar stores deposit into SSB slot, MTE bulk stores deposit address+data-ptr into STQ slot — no L1-D / memory write yet)*. |
-| **Writeback (WB)** | Scalar: broadcast (tag, data) on CDB; write result to physical RF; set ready bit in Scalar RAT; wakeup dependent RS entries. Tile: write data to physical tile in TRegFile-4K; set ready bit in Tile RAT; wakeup dependent tile RS entries. Both: decrement ref-counts for source regs/tiles; if source is orphan and refcnt=0: free it. *(v2: SSB / STQ entries become drain-ready when their branch_tag clears; data/tile actually commits to L1-D / external memory only on drain.)* |
+| **Fetch (F0-F4)** | PC -> I-cache + branch predictor; receive 4 instructions; stitch + IB buffer; F4 handoff |
+| **Decode (D1)** | Decode opcode, identify domain, allocate RID (6-bit program order), resolve atag for sources, classify operands (P/T/U) |
+| **Rename (D2)** | Read SMAP for source ptags; allocate new ptag from free list; update SMAP (live); push MapQ entry; T/U stack push for tile operands. If branch: allocate branch_tag from 8-slot pool. |
+| **Rename (D3)** | Write SMAP (committed state); initialize Ready Table source-ready bits; assign IQ routing |
+| **Dispatch (S1)** | Check free list vacancy, MapQ space, IQ vacancy per routing target |
+| **Dispatch (S2)** | Write IQ entries (alu_iq / bru_iq / lsu_iq); update free list; advance MapQ head |
+| **Issue (P1)** | Ready Table bitmap query (O(1) per ptag); age-matrix cascaded pick selects oldest-ready per IQ |
+| **Issue (I1)** | Physical RF read-port arbitration across 7 issue slots |
+| **Issue (I2)** | Confirm IQ entry deallocation; confirm RF port occupancy |
+| **Execute (E1-EX_n)** | Compute result (variable latency). Scalar stores deposit into SSB; MTE bulk stores deposit into STQ. |
+| **Writeback (W1)** | CDB/TCB broadcast; write to physical RF; Ready Table update (set ready bit); wakeup dependents; free orphans |### 10.3 Rename Register State (atag / ptag / SMAP / CMAP / MapQ)
 
-### 10.3 Register Alias Table (RAT) Operation
+The BCC scalar pipeline replaces the Scalar RAT with a **three-table model**: CMAP (committed map), SMAP (speculative map), and MapQ (speculative rename increment log). The Tile RAT and Tile Metadata RAT are unchanged from v2.
 
-> **(v1 → v2: 复制自 v1 §10.3。v2 在 Tile RAT 旁增加了 Tile Metadata RAT,语义见 §6.1。)**
-
-The two RATs (Scalar and Tile) plus the new Tile Metadata RAT are the core state machines of the processor. In the absence of a ROB, the RATs are the **definitive mapping** from architectural to physical registers.
-
-**Scalar RAT rename example (4-wide, single cycle, v1, 未变更):**
+**Rename example (4-wide, 3-stage D1/D2/D3):**
 
 ```
   Instruction stream:
@@ -1801,159 +1952,161 @@ The two RATs (Scalar and Tile) plus the new Tile Metadata RAT are the core state
     i2:  SUB  X5, X8, X9
     i3:  ADD  X10, X5, X6
 
-  Before rename:
-    Scalar RAT: X2→P2, X3→P3, X5→P5, X7→P7, X8→P8, X9→P9
+  Before D1:
+    CMAP: X2->P2, X3->P3, X5->P5, X6->P41, X7->P7, X8->P8, X9->P9
+    SMAP: (matches CMAP initially)
+    Ready Table: all allocated ptags ready
 
-  Rename (all in one cycle at D2):
-    i0: src1=P2, src2=P3, dst=P40 (new);  RAT: X5→P40;  P5 marked orphan
-    i1: src1=P40 (bypass from i0), src2=P7, dst=P41;  RAT: X6→P41
-    i2: src1=P8, src2=P9, dst=P42 (new);  RAT: X5→P42;  P40 marked orphan
-    i3: src1=P42 (bypass from i2), src2=P41 (bypass from i1), dst=P43;  RAT: X10→P43
+  D1 (Decode + RID/atag allocation):
+    i0: RID=0, atag=X5,X2,X3;  i1: RID=1, atag=X6,X5,X7; ...
 
-  After rename:
-    Scalar RAT: X2→P2, X3→P3, X5→P42, X6→P41, X7→P7, X8→P8, X9→P9, X10→P43
-    Orphans: P5 (old X5), P40 (old X5, transient within group)
-    Free when: orphan AND refcount=0
+  D2 (Rename Request):
+    i0: src0=P2, src1=P3, dst=P80 (new);  SMAP[X5]<=P80;  P5 orphan;  MapQ<= {X5, P5, P80, RID=0}
+    i1: src0=P80 (bypass), src1=P7, dst=P81 (new);  SMAP[X6]<=P81;  MapQ<= {X6, P41, P81, RID=1}
+    i2: src0=P8, src1=P9, dst=P82 (new);  SMAP[X5]<=P82;  P80 orphan;  MapQ<= {X5, P80, P82, RID=2}
+    i3: src0=P82 (bypass), src1=P81 (bypass), dst=P83 (new);  SMAP[X10]<=P83
+
+  D3 (Rename Complete):
+    SMAP committed: X2->P2, X3->P3, X5->P82, X6->P81, X7->P7, X8->P8, X9->P9, X10->P83
+
+  Ready Table at S2 dispatch:
+    Clear bits: P80, P81, P82, P83 (not yet ready)
+
+  On CDB writeback (e.g. i0 completes):
+    Ready Table.set(P80)  -> P80 ready
+    -> P1 can_issue recomputed -> P1 picks i1 (src0=P80 now ready)
+
+  On orphan detection (i2 renamed X5->P82; i0's result P80 now orphan):
+    refcount[P80]-- -> if refcount[P80]==0: free_list.push(P80)
 ```
 
-**Tile RAT rename example (v1, 未变更):**
+**Tile RAT rename example** (unchanged from v2, shown for completeness):
 
 ```
   Instruction stream:
-    i0:  TILE.LD  T10, [X5]            (scalar src X5, tile dst T10)
-    i1:  TILE.LD  T20, [X6]            (scalar src X6, tile dst T20)
-    i2:  VADD     T10, T10, T20        (tile src T10, T20; tile dst T10)
-    i3:  TILE.ST  [X7], T10            (scalar src X7, tile src T10)
+    i0:  TILE.LD  T10, [X5]
+    i1:  TILE.LD  T20, [X6]
+    i2:  VADD     T10, T10, T20
+    i3:  TILE.ST  [X7], T10
 
   Before rename:
-    Tile RAT: T10→PT10, T20→PT20
+    Tile RAT: T10->PT10, T20->PT20
 
-  Rename (all in one cycle at D2):
-    i0: scalar src=<from Scalar RAT>, tile dst=PT100 (new);  Tile RAT: T10→PT100;  PT10 orphaned
-    i1: scalar src=<from Scalar RAT>, tile dst=PT101 (new);  Tile RAT: T20→PT101;  PT20 orphaned
-    i2: tile src1=PT100 (bypass i0), tile src2=PT101 (bypass i1),
-        tile dst=PT102 (new);  Tile RAT: T10→PT102;  PT100 orphaned
-    i3: tile src=PT102 (bypass i2);  no tile dst (store)
+  Rename (D2, unchanged from v2):
+    i0: scalar src=<from SMAP>, tile dst=PT100 (new);  Tile RAT: T10->PT100;  PT10 orphaned
+    i1: scalar src=<from SMAP>, tile dst=PT101 (new);  Tile RAT: T20->PT101;  PT20 orphaned
+    i2: tile src1=PT100 (bypass), tile src2=PT101 (bypass), tile dst=PT102 (new);  Tile RAT: T10->PT102
+    i3: tile src=PT102 (bypass);  no tile dst (store)
 
   After rename:
-    Tile RAT: T10→PT102, T20→PT101
-    Tile orphans: PT10 (old T10), PT20 (old T20), PT100 (old T10, transient)
-    Free when: orphan AND tile refcount=0
+    Tile RAT: T10->PT102, T20->PT101
 ```
 
-**Tile Metadata RAT (v2 增量):** A 256 × 32 b sibling SRAM holding `(shape.x, shape.y, format)` per physical tile. Updated by retire-time writes from producing instructions; read together with the tile's first strip during operand fetch (§9.2.1).
+**Tile Metadata RAT** (unchanged from v2): A 256 x 32 b SRAM holding (shape.x, shape.y, format) per physical tile. Updated by retire-time writes; read together with the tile's first strip during operand fetch.### 10.4 Ready Table + CDB / TCB
 
-### 10.4 Common Data Bus / Tile Completion Bus
+The BCC scalar pipeline introduces the **Ready Table** (128-bit bitmap) as the primary scalar wakeup mechanism. The CDB and TCB remain for result broadcast and tile completion.
 
-> **(v1 → v2: 端口数 / 数据线宽完整复制自 v1 §10.4。v2 在 TCB 每端口增加 1 b "metadata committed" 标志。)**
+**Ready Table** (described in full in Section 7.3):
 
-The CDB is a broadcast network connecting execution unit outputs to reservation stations and the physical register file.
+```
+Ready Table: 128-bit bitmap
+  bit[i] = 1: ptag i has a valid value (ready)
+  bit[i] = 0: ptag i is waiting for writeback
+
+set(ptag):    mask |= (1 << ptag)     # On CDB writeback
+clear(ptag):  mask &= ~(1 << ptag)    # On ptag allocation at D2
+read(i):       return (mask >> i) & 1  # Combinational, O(1)
+```
+
+**CDB / TCB** (unchanged from v2 except for Ready Table integration):
 
 | Parameter | Value |
 |-----------|-------|
 | CDB ports | **6** (4 ALU + 1 MUL/LSU + 1 TILE.GET) |
-| Broadcast width | 7-bit tag + 64-bit data per port |
-| Snoop points | All RS entries (32+24+24+4+16 = 100 entries × 2 scalar sources in v2) |
+| Broadcast width | 7-bit ptag + 64-bit data per port |
+| Snoop points | Ready Table update (not per-RS-entry comparison) |
 
-The CDB carries scalar physical register tags and 64-bit data. Instructions that produce tile results use the **Tile Completion Bus (TCB)** instead. The CDB is used by:
-- Scalar ALU, MUL/DIV, Branch, LSU results (5 ports)
-- **TILE.GET** that produces a scalar GPR result (shared port 6)
+When the CDB broadcasts a result (ptag, data):
+1. **Ready Table update**: `ready.set(ptag)` -- set bit in bitmap
+2. **Physical RF write**: capture data at destination ptag
+3. **Tile Completion Bus (TCB)**: unchanged from v2, 4 ports, 8-bit tile tag
 
-**Tile Completion Bus (TCB):** A lightweight broadcast network (8-bit physical tile tag, no data payload, **+1 b metadata-committed in v2**) with **4 ports** supporting up to 4 simultaneous tile completions per cycle. TCB port allocation:
+TCB port allocation (unchanged from v2):### 10.5 Physical Register Freeing (Reference Counting)
 
-| TCB port | Source |
-|----------|--------|
-| TCB0 | Vector unit (VEC-4K-v2 ALU/FMA/PTO destination tile) |
-| TCB1 | Cube unit (CUBE.DRAIN destination tile) |
-| TCB2 | MTE unit — TILE.LD / TILE.GATHER / TILE.ZERO / TILE.COPY / TILE.PUT completion (port 1) |
-| TCB3 | MTE unit — TILE.LD / TILE.GATHER / TILE.ZERO / TILE.COPY / TILE.PUT completion (port 2) |
-
-Each tile-domain RS entry compares its physical tile source tags against all 4 TCB tags for wakeup, mirroring CDB wakeup for scalar RS entries. MTE instructions that do not produce a tile destination (TILE.ST, TILE.SCATTER) do not broadcast on the TCB.
-
-Each CDB port can broadcast one result per cycle. When a result is broadcast (v1 §10.4, 未变更):
-
-1. **Wakeup:** Every scalar/LSU RS entry compares its source tags against the broadcast tag. On match, the ready bit is set and data is captured.
-2. **RF write:** The physical register file captures the data at the destination tag.
-3. **RAT status:** The ready bit for the physical register is set in the RAT status table.
-
-### 10.5 Physical Register Freeing (Reference Counting)
-
-> **(v1 → v2: 内容未变更,以下完整复制自 v1 §10.5。)**
-
-Without a ROB, the processor cannot use retirement to determine when a physical register is dead. Instead, it uses a **reference counting** scheme, applied identically to both scalar physical registers and physical tile registers:
+> **(v1 -> v2 BCC: SMAP replaces Scalar RAT for the P-reg freeing path; Tile RAT unchanged. The refcount mechanism itself is identical to v1.)**
 
 ```
   Per physical scalar register (128 entries):
-    ┌──────────┬──────────┬───────────┐
-    │ orphan   │ refcount │ state     │
-    │ (1 bit)  │ (4 bits) │           │
-    └──────────┴──────────┴───────────┘
+    orphan (1 bit) | refcount (4 bits)
 
   Per physical tile register (256 entries):
-    ┌──────────┬──────────┬───────────┐
-    │ orphan   │ refcount │ state     │
-    │ (1 bit)  │ (3 bits) │           │
-    └──────────┴──────────┴───────────┘
+    orphan (1 bit) | refcount (3 bits)
 
   State machine (same for both):
-    MAPPED:   RAT points to this register; refcount tracks in-flight readers
-    ORPHAN:   RAT no longer points here (remapped); refcount may be > 0
-    FREE:     orphan AND refcount == 0 → returned to free list
+    MAPPED:   SMAP/Tile RAT points to this register; refcount tracks in-flight readers
+    ORPHAN:   SMAP/Tile RAT no longer points here (remapped); refcount may be > 0
+    FREE:     orphan AND refcount == 0 -> returned to free list
 ```
 
-Tile refcount is 3 bits (max 7 concurrent readers per physical tile), which suffices because the Vector RS (24 in v2), Cube RS (4), and MTE RS (16) issue at most a few readers per tile simultaneously. Scalar refcount is 4 bits (max 15).
-
-**Lifecycle events (identical for scalar and tile):**
+**Lifecycle events:**
 
 | Event | orphan | refcount | Action |
 |-------|--------|----------|--------|
-| Allocated as destination at D2 | 0 | 0 | Added to RAT mapping |
-| Instruction reads this register (dispatched to RS) | — | +1 | Reader registered |
-| Reader completes execution (reads at IS/EX) | — | −1 | Reader done |
-| RAT remaps arch-reg to new physical register | 1 | — | Old mapping becomes orphan |
+| Allocated as destination at D2 | 0 | 0 | Added to SMAP mapping |
+| Instruction reads this register (dispatched to IQ) | -- | +1 | Reader registered |
+| Reader completes execution (at I1/I2) | -- | -1 | Reader done |
+| SMAP remaps atag to new ptag | 1 | -- | Old mapping becomes orphan |
 | refcount reaches 0 while orphan=1 | 1 | 0 | **Free**: return to free list |
 
-**Branch misprediction and ref-counts:** When a mispredict occurs, all instructions younger than the branch are flushed. Their RS entries are invalidated, and the ref-counts for their source registers (scalar and tile) are decremented. Physical registers/tiles allocated as destinations by flushed instructions are returned directly to their respective free lists. Both free list head pointers are restored from the checkpoint to reclaim all speculatively allocated registers.
+**Branch misprediction and ref-counts:** When a mispredict occurs, all instructions younger than the branch are flushed. MapQ reverse replay restores SMAP to CMAP state, reclaiming all speculatively allocated ptags. Physical registers allocated as destinations by flushed instructions are returned directly to their respective free lists. Ready Table is reset to ALL_ONES (conservative).### 10.6 Branch Recovery (BCC Scalar Pipeline)
 
-### 10.6 Branch Recovery
-
-> **(v1 → v2: v1 的 1-cycle dual-RAT restore 序列完整保留;v2 在并行加上 SSB/STQ flush。详细投机恢复机制见 §11。)**
+On a branch mispredict, the BCC scalar pipeline recovers via **MapQ reverse replay** + **branch-tag CAM-clear** on all physical IQs.
 
 ```
   ┌────────────────────────────────────────────────────────────┐
-  │  Branch Misprediction Recovery (v1 baseline + v2 增量)     │
+  │  Branch Misprediction Recovery (BCC Scalar Pipeline)           │
   │                                                            │
   │  Cycle 0: Branch resolves as MISPREDICTED at EX1          │
-  │    → Identify checkpoint ID and branch_tag from RS entry  │
+  │    -> flush_rid = branch.rid (from IQ entry)              │
+  │    -> flush_btag = branch.branch_tag (3-bit)              │
   │                                                            │
   │  Cycle 1: Recovery actions (all in parallel):              │
-  │    a) Flash-restore: checkpoint[id] → active Scalar RAT   │
-  │    b) Flash-restore: checkpoint[id] → active Tile RAT     │
-  │    c) Restore scalar free-list head pointer                │
-  │    d) Restore tile free-list head pointer                  │
-  │    e) Restore RAS top pointer from checkpoint              │
-  │    f) Invalidate all RS entries younger than branch         │
-  │    g) Decrement ref-counts (scalar + tile) for flushed ops │
-  │    h) Deallocate all checkpoints younger than this branch  │
-  │    i) (v2) Flush SSB entries with btag = mispredict_tag    │
-  │       or any descendant tag (parallel CAM clear, §11.4.4)  │
-  │    j) (v2) Flush STQ entries similarly (§11.5.1)           │
-  │    k) (v2) Reset Tile-Metadata RAT delta-tag from checkpt  │
+  │                                                            │
+  │    (a) MapQ reverse replay:                                │
+  │        for each MapQ entry (youngest to oldest):           │
+  │          if entry.rid > flush_rid:                        │
+  │            SMAP[entry.atag] = entry.old_ptag              │
+  │            refcount[entry.new_ptag]--                    │
+  │            refcount[entry.old_ptag]++                     │
+  │            entry.valid = 0                                 │
+  │          else: break                                      │
+  │        -> SMAP == CMAP (exact committed state)              │
+  │                                                            │
+  │    (b) Physical IQ CAM-clear:                             │
+  │        for each alu_iq / bru_iq / lsu_iq entry:           │
+  │          if entry.checkpoint_id > flush_checkpoint:        │
+  │            entry.valid = 0                                 │
+  │                                                            │
+  │    (c) Ready Table: mask <= ALL_ONES                     │
+  │       (conservative; all ptags become temporarily untrusted)│
+  │                                                            │
+  │    (d) SSB flush: entries with btag >= flush_btag invalid │
+  │                                                            │
+  │    (e) STQ flush: entries with btag >= flush_btag invalid  │
+  │                                                            │
+  │    (f) Tile RAT: unchanged from v2 (independent domain)   │
+  │                                                            │
+  │    (g) Free list: restore head from CMAP state           │
   │                                                            │
   │  Cycle 2: Redirect fetch PC to correct branch target       │
   │                                                            │
-  │  Cycle 3+: New instructions begin entering F1               │
+  │  Cycle 3+: New instructions begin entering F0             │
   │                                                            │
-  │  Total penalty: 6 cy (v1) → 6 cy (v2; SSB/STQ flush is     │
-  │                       parallel and adds 0 cy hot-path)     │
+  │  Total penalty: 6-7 cy (MapQ replay parallel with others)  │
   └────────────────────────────────────────────────────────────┘
 ```
 
-The basic v1 branch-recovery sequence (RAT flash-restore, free-list-head restore, RS flush) is preserved. **Section 11 specifies the additional mechanisms required for safe speculative execution beyond branch prediction**: SSB / STQ flush, branch-tag ancestry tracking, and the proof that this set of mechanisms is **sufficient to keep architectural state correct without a Reorder Buffer**.
-
----
-
-## 11. Speculative Execution Recovery Without a Reorder Buffer
+The MapQ replay is O(depth) = 12 iterations maximum. All recovery actions run in parallel within the single recovery cycle.## 11. Speculative Execution Recovery Without a Reorder Buffer
 
 > **Question:** The v1 design eliminates the Reorder Buffer (ROB) by leveraging the no-precise-exception envelope, using the Reservation Station + reference-counting + RAT-checkpoint trio for OoO execution. v2 adds branch-prediction-driven **speculative execution** to extend the OoO window past unresolved branches. Can we do this safely — i.e., guarantee that a misspeculated path **never** corrupts architectural state — **without** introducing a ROB?
 >
@@ -1977,7 +2130,7 @@ When an instruction executes speculatively (i.e. depends on an unresolved branch
 
 | Class | What it touches | Who recovers it on flush | Currently handled by |
 |-------|-----------------|---------------------------|----------------------|
-| **A. Renamed register / tile state** | Writes to a physical scalar register (P0–P127), a physical tile (PT0–PT255), or a metadata RAT entry | Returns to free list once orphan + refcount=0 (no ROB needed) | RAT checkpoint flash-restore + refcount + free-list-head restore |
+| **A. Renamed register / tile state** | Writes to a ptag (P0–P127), a physical tile (PT0–PT255), or a metadata RAT entry | Returns to free list once orphan + refcount=0 (no ROB needed) | **MapQ reverse replay + SMAP restore + refcount + free-list restore** (BCC scalar pipeline) |
 | **B. Pipeline state** | Occupies an RS slot; in flight in EX stages; consumes CDB/TCB cycles | Branch-tag CAM-clear invalidates the RS entry; in-flight EX is flushed at WB | Branch-tag stamping at D2 (§5.1, §6.2) |
 | **C. Externally-visible state** | Writes to L1-D / L2 cache, scatters to memory, MMIO accesses, fences/barriers, cross-core observable ordering | **Cannot be recovered** once it leaves the core | **NEW: SSB (§11.4) and STQ (§11.5) gate these to never *reach* memory until non-speculative** |
 
@@ -2192,63 +2345,72 @@ These limitations are consistent with the v1 design envelope (run-to-completion 
 
 | Aspect | ROB-based design | Davinci-v2 (no ROB) |
 |--------|------------------|---------------------|
-| Recovery for register / tile state | ROB walks back, undoes mappings in order | RAT flash-restore + refcount free; **same outcome, simpler hardware** |
+| Recovery for register / tile state | ROB walks back, undoes mappings in order | **MapQ reverse replay + SMAP <- CMAP + refcount free**; instruction-precise, more efficient |
 | Recovery for memory stores | Stores in ROB / coupled SQ; release on retire | **SSB / STQ** with branch-tag gating |
 | Recovery for fences / CSR | ROB serializes; instruction retires in order | Issue gated on `btag = 0xFF`; correct but adds 0–6 cy latency |
 | Speculative depth | bounded by ROB capacity (typically 64–256 entries) | bounded by **8 active branch tags** (≈ 8-deep nested branches) |
-| Storage overhead | ROB ≈ 256 entries × ~150 b = ~5 KB + retirement logic | Branch-tag tracker (5 K gate) + SSB extension (24 vs 16, +8 entries × 182 b ≈ ~1.5 KB) + STQ (8 × 110 b ≈ ~1 KB) ≈ **~2.5 KB total** |
-| Wakeup logic | RS does dependency tracking; ROB independent | **RS does dependency tracking AND speculation tracking** via branch-tag CAM (∝ RS size, already paid for) |
-| Mispredict penalty | ROB walk-back + flush ≈ 5–10 cy | RAT flash-restore + SSB/STQ tag-CAM-clear ≈ **1 cy parallel restore + 6-cy refill = 7 cy** |
+| Storage overhead | ROB ≈ 256 entries × ~150 b = ~5 KB + retirement logic | Branch-tag tracker (5 K gate) + SSB/STQ (~2.5 KB) + MapQ (144 B) + Ready Table (16 B) ≈ **~3 KB total** |
+| Wakeup logic | RS does dependency tracking; ROB independent | **Ready Table (128-bit bitmap) replaces CDB comparators**: 0 comparators vs. 384 for scalar RS; O(1) ptag lookup |
+| Mispredict penalty | ROB walk-back + flush ≈ 5–10 cy | **MapQ replay + Ready Table reset + IQ CAM-clear + SSB/STQ flush**: all parallel in 1 cy + 6-cy refill = 7 cy |
 | Precise exceptions | yes (free) | no (out of envelope) |
 | Single-thread TSO memory ordering | yes | yes (FIFO drain through SSB) |
 
 **The key insight:** in environments where precise exceptions are not required (the AI-kernel envelope), the ROB's three bundled services unbundle naturally. Service (1) is free if you don't need it. Service (3) is replaced by reference counting. Service (2) — **the only remaining service** — is implemented by the SSB + STQ + branch-tag tracker at a fraction of a ROB's cost.
 
-### 11.9 Cycle-by-cycle example: speculative store followed by mispredict
+### 11.9 Cycle-by-cycle example: speculative store followed by mispredict (BCC Scalar Pipeline)
 
 ```
   Cycle  Action
-  ─────  ──────────────────────────────────────────────────────────────────
-   0     Branch B1 enters D2; allocated tag t=3, state[3] = speculative
+  ───  ────────────────────────────────────────────────────────────────────────────
+   0     Branch B1 enters D1; allocated tag t=3, state[3] = speculative
+         B1 pushes MapQ entry {atag=B1_dst, old_ptag, new_ptag, rid=B1.rid}
    1     SD X5, [X8]+0    — younger than B1 — D2 allocates SSB[7] tagged 3
+         MapQ push: {atag=X5, old=P5, new=P80, rid=next}
    2     SD X6, [X8]+8    — younger than B1 — D2 allocates SSB[8] tagged 3
    3     SD X7, [X8]+16   — younger than B1 — D2 allocates SSB[9] tagged 3
-   4     ... 5 more in-flight instructions ...
-   9     B1 reaches EX1: mispredicted!
-  10     state[3] = wrong; all RS entries with btag = 3 invalidated;
-         SSB[7], SSB[8], SSB[9] set valid ← 0; tile/scalar free-list heads
-         restored from checkpoint[3]; RAT restored from checkpoint[3]
+   4-8   ... more instructions dispatched to physical IQs ...
+   9     B1 reaches EX1: mispredicted!  flush_rid = B1.rid; flush_btag = 3
+  10     MapQ reverse replay (all in parallel):
+           (1) SMAP restored to CMAP (entries with rid > flush_rid undone)
+           (2) Physical IQ CAM-clear: entries with checkpoint_id > flush_btag invalidated
+           (3) Ready Table: mask <= ALL_ONES (conservative reset)
+           (4) SSB[7..9] valid ← 0
+           (5) Free list head restored from CMAP state
   11     Fetch redirected to correct branch target
   12-16  Front-end refill (5 cy)
-  17     First correct-path instruction enters EX1 (total mispredict
-         penalty: 17 - 10 = 7 cy front-end refill + 1 cy restore = 8 cy)
+  17     First correct-path instruction enters EX1 (total mispredict penalty = 7 cy)
 
   Architectural state at cycle 17:
     Memory: NEVER wrote SSB[7..9]. Cache lines unaffected. Correct.
-    X5, X6, X7: physical reg mappings rolled back via RAT restore.
-    Free lists: include the orphan physical regs allocated in cycles 1–8.
+    SMAP == CMAP: MapQ replay restored all speculative renames.
+    P80, P81, P82, P83: freed (orphan + refcount=0 after replay).
+    Ready Table: all bits reset; instructions re-query on next cycle.
 ```
 
-The mispredict is recovered in 8 total cycles — one cycle longer than v1's 6-cy penalty for two reasons:
+**Key BCC scalar pipeline differences:**
 
-1. **One additional cycle of redirect** because the branch tag's CAM-clear must propagate to all RS entries before the next instruction enters DS. (v1's 6-cy penalty assumed instantaneous RS flush; v2 makes this explicit.)
-2. **One additional cycle of front-end refill** in the worst case where the first correctly-fetched instruction's source register depends on a value being restored to the RAT.
+- MapQ entries are pushed at D2 for each P-dst rename, carrying `{atag, old_ptag, new_ptag, rid}`.
+- On flush, MapQ reverse replay (max 12 iterations) restores SMAP to exact CMAP state.
+- Physical IQ entries are CAM-cleared by `checkpoint_id` (MapQ entry ID), not just `btag`.
+- Ready Table reset ensures no stale ready bits survive the flush.
 
-In practice, both effects can be hidden through pipelining (the CAM-clear is parallel; the front-end refill is identical to v1). The realistic mispredict penalty for v2 is **6–7 cycles**, well within the v1 envelope.
+The mispredict is recovered in 7 total cycles. The MapQ replay runs in parallel with the IQ CAM-clear and Ready Table reset — all within the single recovery cycle.
 
 ### 11.10 Hardware cost summary
 
-| Block | v2 addition | Gate count |
-|-------|-------------|------------|
-| Branch-tag tracker (state vector + ancestry bitmap + FSM) | new | ~5 K |
-| Speculative Store Buffer (24 entries, 182 b each) | extends v1's 16-entry store buffer | ~80 K (incl. CAM) |
-| Speculative Tile-Store Queue (8 entries, 110 b each) | new | ~12 K |
-| Branch-tag stamping in RS entries (24 + 16 + 24 + 4 + 16 = 84 entries × 3 b) | extends RS entry width | ~2 K |
-| Checkpoint extension (+13 b/slot × 8 slots) | extends checkpoint store | ~1 K |
-| Tile Metadata RAT (256 × 32 b SRAM, 4R/2W) | new (also serves §6.1) | ~10 K |
-| **Total v2 speculation hardware** | | **~110 K gate (~0.025 mm² @ 5 nm)** |
+| Block | BCC scalar pipeline change | Gate count |
+|-------|--------------------------|------------|
+| Branch-tag tracker (state vector + ancestry bitmap + FSM) | unchanged | ~5 K |
+| Speculative Store Buffer (24 entries, 182 b each) | unchanged | ~80 K |
+| Speculative Tile-Store Queue (8 entries, 110 b each) | unchanged | ~12 K |
+| Branch-tag stamping in IQ entries | unchanged (now across 3 IQs) | ~2 K |
+| MapQ (12-entry ring buffer, ~96 b/entry) | **replaces RAT checkpoint store** | ~1.5 K |
+| Ready Table (128-bit bitmap + control) | **new** | ~1 K |
+| CDB comparator reduction | **384 -> 0** (Ready Table replaces all) | ~-50 K (saves area) |
+| Tile Metadata RAT (256 × 32 b SRAM) | unchanged | ~10 K |
+| **Total v2 BCC speculation hardware** | | **~113 K gate** |
 
-This is **~3.5%** of the ~3.26 mm² total core area (v1) — far less than a comparable-capacity ROB (typically 256 entries × ~10 b/entry with full retirement bypass = ~50 K gate just for storage, plus equivalent forwarding logic that would push a ROB-based v2 to ~300–500 K gate of new structure).
+The v2 BCC speculation hardware is **~3.5%** of the ~3.26 mm² total core area — the same as v2 with RAT checkpoints. The Ready Table (~1 K gate) and MapQ (~1.5 K gate) add negligible area. The key win is the **CDB comparator elimination** (~50 K gate saved) and the **IQ split** (simpler, more scalable). The net gate count for the scalar wakeup/issue path is approximately equal or slightly lower than v1.
 
 ---
 
