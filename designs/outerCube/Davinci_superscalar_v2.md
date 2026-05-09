@@ -17,7 +17,7 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
    - **Three new PTO instructions** natively enabled by the v2 datapath: `TINV` (matrix inverse up to 128×128 FP32 / 16-tile range), `TROWRANGE_MUL` (column-wise product over a dynamic row sub-range), `TMRGSORT` (full-tile mergesort over any `N = 2^p` up to 8192 via a reconfigurable 256-lane shuffle + compare-swap primitive).
 3. **Speculative out-of-order execution** with a **ROB-less recovery scheme** that nonetheless guarantees architectural state is never corrupted by a misspeculated path (§11). The mechanism extends the v1 RAT-checkpoint + reference-counting infrastructure with a **branch-tagged speculative store buffer** for scalar memory and a **speculative tile-store queue** for MTE memory writes — both of which gate visible side effects until the producing branch tag becomes non-speculative. Section 11 walks through why this is sufficient without a Reorder Buffer, what it costs in area / latency, and which workloads it can and cannot serve correctly.
 
-> **Design discipline:** The v2 core continues to assume **run-to-completion kernel execution** with **no precise architectural exceptions and no OS-level interrupts** — the same envelope as v1. The new speculation-recovery mechanism handles **branch mispredictions** only; it does **not** turn the core into a precise-exception machine. Section 11.7 enumerates the remaining "non-recoverable" classes (asynchronous page faults, signaling NaNs, ECC errors observed mid-kernel) and the kernel-level conventions that bound them.
+> **Design discipline:** The v2 core assumes **run-to-completion kernel execution** with **no OS-level interrupts** — the same envelope as v1. The new v2.3 **Block-ROB (BROB)** adds **block-granularity precise exception support**, enabling the core to identify the faulting instruction block and recover precisely when an exception (trap, page fault, illegal instruction) does occur. The new speculation-recovery mechanism handles **branch mispredictions** and **variable-latency tile ops**; Section 11.7 enumerates the remaining "non-recoverable" classes (asynchronous page faults, signaling NaNs, ECC errors observed mid-kernel) and the kernel-level conventions that bound them.
 
 ### 1.1 Key Parameters (v2 deltas in **bold**)
 
@@ -40,6 +40,14 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
 | **MapQ depth** | **12** entries (speculative rename increment log; instruction-precise recovery via reverse replay; replaces RAT checkpoint snapshots) |
 | **Branch tag width** | **3 b** (matches checkpoint count); attached to every in-flight RS / store-buffer / tile-store-queue entry |
 | Physical IQ entries | Scalar ALU: **48**, Scalar BRU: **16**, LSU: **32**, Vector: **24**, Cube: **4**, MTE: **16** |
+| **GVIQ (Grouped Vector IQ) entries** | **32** entries; 1 VTG micro-op / cycle; entry prefix: block_id + pc_index + group_id + iter0..iter3 |
+| **VTG (Vector Thread Group) count** | **16** x 256 B VTGs / tile (`G256`) or **8** x 512 B VTGs / tile (`G512`) |
+| **Micro-instruction buffer depth** | **16** entries; shared by all VTGs in a tile group; max **64** micro-ops per block |
+| **SIMD lanes per VTG beat** | **128** (FP32) . **256** (FP16/BF16) . **512** (FP8) . **1024** (FP4) |
+| **GVIQ (Grouped Vector IQ) entries** | **32** entries; 1 VTG micro-op / cycle; entry prefix: block_id + pc_index + group_id + iter0..iter3 |
+| **VTG (Vector Thread Group) count** | **16** × 256 B VTGs / tile (`G256`) or **8** × 512 B VTGs / tile (`G512`) |
+| **Micro-instruction buffer depth** | **16** entries; shared by all VTGs in a tile group; max **64** micro-ops per block |
+| **SIMD lanes per VTG beat** | **128** (FP32) · **256** (FP16/BF16) · **512** (FP8) · **1024** (FP4) |
 | **Speculative store buffer entries** | **24** (was 16 in v1; widened to absorb branch-tag gating §11.4) |
 | **Speculative tile-store queue** | **8** entries (branch-tag-gated, MTE-side §11.5) |
 | L1-I cache | 64 KB, 4-way, 64 B line |
@@ -52,6 +60,10 @@ The Davinci-v2 core is a **single-threaded, 4-wide, out-of-order, speculatively-
 | Peak FP16 throughput (cube) | **12.3 TFLOPS** |
 | Peak FP8 throughput (cube) | **24.6 TOPS** |
 | Peak MXFP4 throughput (cube) | **98.3 TOPS** |
+| **BROB entries** | **128** (Block Reorder Buffer; tracks instruction block lifetimes for precise exceptions; SS11.11) |
+| **Block SSB entries** | **32** (in-block scalar store buffer; SS11.11) |
+| **Block STQ entries** | **16** (in-block tile-store buffer; SS11.11) |
+| **BID width** | **8 b** slot index + 56 b sequence (64 b total); SS11.11 |
 
 ### BCC-Style Scalar Pipeline Deltas (v2 BCC overlay)
 
@@ -69,6 +81,26 @@ The following parameters supersede the corresponding v1/v2 entries above when th
 | **Issue stages** | P1 (age-matrix pick) → I1 (RF read-port arbitration) → I2 (confirm issue + IQ deallocation) |
 | **Wakeup latency** | 2 cycles (Ready Table register → can_issue → pick → RF read) |
 | **Flush model** | MapQ reverse replay from `flush_rid` → SMAP restored to exact CMAP state; branch-tag CAM-clear on physical IQs |
+| **VTG execution mode** | Full-tile `T*` + VTG `V*` micro-ops share VEC-4K-v2 ALU; GVIQ (32 entries) handles VTG separately from Vector RS (24 entries) |
+| **VTG scheduling** | GVIQ rotation scheduler picks oldest-ready VTG; `block_id` → micro-instruction buffer lookup; Group Read/Write Adapters select VTG sub-ranges |
+| **SIMD lane count** | 128 lanes/beat (FP32), 256 (FP16/BF16), 512 (FP8), 1024 (FP4) |
+
+---
+
+### BCC-Style Vector Pipeline Deltas (v2.2 VTG overlay)
+
+The following parameters describe the VTG vector micro-instruction overlay on top of the VEC-4K-v2 datapath.
+
+| Parameter | Value |
+|-----------|-------|
+| **VTG modes** | `G256` (16×256 B VTGs/tile) . `G512` (8×512 B VTGs/tile) |
+| **GVIQ depth** | 32 entries, 1-wide issue |
+| **Micro-instruction buffer** | 16 entries (2-way set assoc), max 64 micro-ops/block |
+| **VTG Metadata Table** | 16 entries / physical tile |
+| **VTG Ready Table** | 256-bit bitmap (one bit per PT0..PT255) |
+| **Loop counters per GVIQ entry** | 4 × 16-bit (`iter0..iter3`) |
+| **Group adapters** | Group Read Adapter (TRegFile → VTG sub-range), Group Write Adapter (VTG → TRegFile) |
+| **Paired G256 issue** | Optional: 2 independent 256 B VTGs share one 512 B SIMD group beat |
 
 ---
 
@@ -196,6 +228,61 @@ Tile register fields stay 5 bits (T0–T31). When `c_role = VALUE` and `N_val = 
 ```
 
 **Backward compatibility:** v1 vector instructions decode as `has_mask = 0`, `c_role = MASK`, `retire_mask = 2'b01`, `is_xpose_{A,B,C} = 0` — i.e. unmasked, single-result, no-transpose, no-3rd-tile — and produce bit-exact v1 results. `c_role = VALUE` is only generated by a v2.1-aware compiler emitting `VFMA` / `VFNMA` / `VLERP`; v1 binaries cannot express it.
+
+#### 2.2.6 VTG Vector Micro-Instructions (SIMD-Group Execution)
+
+> **(v2.2 BCC vector overlay — Change Point #2)**
+
+In addition to full-tile `T*` vector instructions, Davinci-v2 supports **VTG (Vector Thread Group) vector micro-instructions** — a warp-grouped execution model where one 4 KB tile is partitioned into multiple SIMD-group-sized scheduling units.
+
+**Key concepts:**
+
+| Concept | Definition |
+|---------|------------|
+| **SIMD group** | The 128-lane execution unit inside VEC-4K-v2; one VTG maps to 1 or 2 SIMD group beats (512 B or 256 B). Not software-visible. |
+| **VTG (Vector Thread Group)** | A warp-like scheduling context: 256 B (`G256` mode, 16 VTGs/tile) or 512 B (`G512` mode, 8 VTGs/tile). Each VTG has its own `group_id`, `thread_id`, `iter0..iter3` loop counters, and `active_lanes` in the GVIQ entry prefix. |
+| **Micro-instruction buffer** | A pre-allocated buffer in the vector ALU, shared by all VTGs in the same tile group. Stores the decoded micro-op list keyed by `block_id`. No re-decode at issue time. |
+
+**Architectural naming:**
+
+```text
+VADD.F32     T4.g2, T4.g0, T4.g1, T4.p0    ; tile T4, groups g0+g1 -> g2, pred p0
+VMULS.F16    T7.g5, T7.g5, X12, T7.p1       ; scalar broadcast mul: X12 to all lanes
+VLD.F32      T8.g0, [Xbase + Xoff], T8.p0   ; vector load into VTG g0
+VST.F32      T8.g2, [Xbase + Xoff], T8.p0    ; vector store from VTG g2
+```
+
+**Instruction families (38 total):**
+
+| Category | Instructions | Notes |
+|----------|-------------|-------|
+| Elementwise ALU | `VADD`, `VSUB`, `VMUL`, `VDIV`, `VMIN`, `VMAX`, `VABS`, `VNEG` | Standard lane-wise ops under predicate |
+| Scalar-broadcast ALU | `VADDS`, `VMULS`, `VMAXS` | Scalar from GPR broadcast via SX/SY staging |
+| Compare & Select | `VCMP.{LT/LE/GT/GE/EQ/NE}`, `VSEL`, `VMERGE` | Compare writes predicate VTG; `VSEL` selects between sources |
+| Conversion | `VCVT.dtype.stype`, `VROUND`, `VTRUNC` | Type conversion with saturation/rounding |
+| Math | `VSQRT`, `VEXP`, `VLOG`, `VRELU` | Non-linear elementwise ops |
+| Predicate | `PLT`, `PAND`, `POR`, `PXOR`, `PNOT` | Predicate generation and logic |
+| Memory | `VLD`, `VST`, `VLDSTRIDE`, `VSTSTRIDE`, `PGATHER` | VTG load/store; inactive lanes do not fault |
+| Reduction / Wide | `VREDUCE_ADD`, `VREDUCE_MAX`, `WADD` | Scalar reduction output; wide 2-VTG result |
+
+**GVIQ entry prefix** (before operand fields):
+
+```text
+{ block_id[11:0], pc_index[7:0], group_id[3:0], thread_id[7:0],
+  iter0[15:0], iter1[15:0], iter2[15:0], iter3[15:0],
+  active_lanes[15:0], active_group_mask[15:0] }
+```
+
+**Full-tile vs. VTG coexistence:**
+
+| Execution mode | ISA prefix | Operand unit | Scheduling unit | Typical use |
+|---------------|-----------|-------------|----------------|-------------|
+| Full-tile `T*` | `T` | 4 KB tile | One tile per VEC op | Large matrix GEMM, full-tile reductions |
+| VTG `V*` micro-op | `V` | 256 B or 512 B VTG | One VTG per GVIQ entry; VTG operates behind VEC-4K-v2 staging (SA/SB/SC) | Strip-mined elementwise, inner loops. VTG latency: **25-32 cy minimum** (8-15 cy prologue + 1 cy compute + 16 cy RMW writeback). VTG reuses VEC-4K-v2 ALU and TRegFile ports (R0/R4/W0) via VEC-domain arbitration. |
+
+The two execution paths share the same VEC-4K-v2 ALU and TRegFile ports (R0/R4 for reads, W0 for writeback). They arbitrate for VEC staging and TRegFile ports via the VEC-domain arbiter. Full-tile VEC ops have higher priority than VTG micro-ops. A VTG micro-op uses the **micro-instruction buffer** (pre-decoded VEC beat-word sequences) rather than the Vector RS opcode field.
+
+**TSPLIT / TJOIN metadata transitions:** The compiler may emit `TSPLIT` (declare tile as NxVTG sub-units) or `TJOIN` (declare VTGs form a coherent tile view) as metadata-only transitions. No physical instruction encoding required — the metadata is set via tile metadata fields at rename time., `c_role = MASK`, `retire_mask = 2'b01`, `is_xpose_{A,B,C} = 0` — i.e. unmasked, single-result, no-transpose, no-3rd-tile — and produce bit-exact v1 results. `c_role = VALUE` is only generated by a v2.1-aware compiler emitting `VFMA` / `VFNMA` / `VLERP`; v1 binaries cannot express it.
 
 #### 2.2.4 Masked / predicated variants
 
@@ -601,6 +688,17 @@ F0 → F1 → F2 → F3 → IB → F4 → D1 → D2 → D3 → S1 → S2 → P1 
                                      ├── Rename ──┤           ├── Issue ──┤           ├── Execute ──┤
 ```
 
+**v2.3 Block-ROB addition:**
+
+```
+  +--------------------------------------------------------------------------------------+
+  |  BROB -- Block Reorder Buffer (v2.3 新增)                                               |
+  |  128-entry; tracks block lifetimes; scalar_done && engine_done gates retire              |
+  |  Block SSB (32) + Block STQ (16) for in-block store commit                            |
+  |  Provides block-granularity precise exception identification                            |
+  +--------------------------------------------------------------------------------------+
+```
+
 ### 4.1 Complete Stage List (BCC Scalar Pipeline)
 
 | Stage | Name | Function |
@@ -621,6 +719,7 @@ F0 → F1 → F2 → F3 → IB → F4 → D1 → D2 → D3 → S1 → S2 → P1 
 | **I2** | **Issue Confirm** | IQ entry deallocation, RF read-port occupancy confirm |
 | E1–EX_n | Execute | Functional unit execution (variable latency) |
 | W1 | Writeback | CDB/TCB broadcast, Ready Table update, wakeup |
+| **16. BROB Retire** | *(v2.3 Block-ROB only)* Block completion check. If : advance BROB head (commit Block SSB/STQ to SSB/STQ). If exception: deliver and squash. If incomplete: stall. Off the critical execution path. |
 
 **Total pipeline depth**: Fetch-to-WB = **17+ cycles** (~5 cycles longer than the 12-stage v1/v2 baseline, due to D1/D2/D3 rename split and P1/I1/I2 issue separation).
 
@@ -1224,6 +1323,100 @@ The I1 stage arbitrates **physical RF read-port access** across all 7 issue slot
 
 The I2 stage **deallocates IQ entries** for the selected instructions and confirms RF read-port occupancy. The physical RF read operation itself begins in I2 (registered input to RF) with data available at the start of E1.
 
+#### 7.4 GVIQ — Grouped Vector Issue Queue (VTG Micro-Instructions)
+
+> **(v2.2 BCC vector overlay — Change Point #2)**
+
+The GVIQ holds VTG vector micro-instructions waiting for their source VTGs to become ready. It is **separate from** the existing Vector RS (24 entries, full-tile `T*` ops). The two paths share the VEC-4K-v2 ALU, TRegFile ports (R0/R4 for reads, W0 for writeback), and SA/SB/SC staging registers.
+
+**VEC-domain arbitration:** The VEC-4K-v2 ALU is 1-wide. The VEC-domain arbiter grants ALU access based on readiness and priority. Full-tile VEC ops (from Vector RS) have **higher priority** than VTG micro-ops (from GVIQ) because they are coarser-grain and hold the prologue longer.
+
+**GVIQ entry** (before operand fields):
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `valid` | 1 b | Entry is live |
+| `block_id` | 12 b | Index into micro-instruction buffer (shared by all VTGs in this block) |
+| `pc_index` | 8 b | Current micro-instruction within block (0..63) |
+| `tile_group` | 5 b | Architectural tile T0..T31 |
+| `phys_tile` | 8 b | Physical tile PT0..PT255 (after Tile RAT rename) |
+| `group_id` | 4 b | VTG index: 0..15 (`G256`) or 0..7 (`G512`) |
+| `group_mode` | 1 b | `G256` (0) or `G512` (1) |
+| `thread_id` | 8 b | Scheduler context (usually = `group_id`) |
+| `iter0..iter3` | 4x16 b | Loop counters for VTG's current iteration |
+| `active_lanes` | 16 b | Active lane count or mask |
+| `active_group_mask` | 16 b | Which VTG groups are active in this block |
+
+**GVIQ operand fields** (after prefix):
+
+| Field | Width | Description |
+|-------|-------|-------------|
+| `src0_ptag` | 8 b | Physical tile tag for source VTG 0 |
+| `src1_ptag` | 8 b | Physical tile tag for source VTG 1 |
+| `src2_ptag` | 8 b | Physical tile tag for source VTG 2 |
+| `pred_ptag` | 8 b | Physical tile tag for predicate VTG |
+| `dst_ptag` | 8 b | Physical tile tag for destination VTG |
+| `has_dst` | 1 b | Whether this micro-op writes a VTG |
+| `src_ready` | 4 b | VTG-ready bits: src0/1/2/pred ready |
+| `vtg_ready` | 1 b | All source VTGs ready + loop counters ready |
+| `branch_tag` | 3 b | Branch tag for speculation gating |
+
+**Micro-instruction buffer** (in vector ALU):
+
+The micro-instruction buffer is a **set-associative buffer** (16 entries, 2-way) keyed by `block_id`. Each entry stores the pre-decoded micro-op list for a tile group:
+
+```text
+BufferEntry {
+  valid:     1 b
+  block_id:  12 b  [tag]
+  pc_limit:  8 b   [max pc_index]
+  micro_ops: array[64] of MicroOpEntry
+}
+
+MicroOpEntry {
+  opcode:     12 b   // VADD / VMUL / VCMP / VLD / VST / ...
+  elem_type:  4 b   // FP32 / FP16 / FP8 / FP4 / ...
+  pred_mode:  1 b   // 0=zeroing, 1=merging
+  src0_ref:   VTGRef | Scalar | Imm
+  src1_ref:   VTGRef | Scalar | Imm | None
+  src2_ref:   VTGRef | Scalar | Imm | None
+  dst_ref:    VTGRef
+  pred_ref:   VTGRef | implicit_all_true
+  imm:        32 b  // immediate or address offset
+}
+```
+
+At P1/I1 issue time, the GVIQ winner's `{block_id, pc_index}` drives a single-cycle buffer lookup. The `MicroOpEntry` drives VEC staging control, ALU opcode, and writeback routing — no re-decode needed.
+
+**VTG wakeup:** VTG readiness is tracked by a **256-bit VTG Ready Table** (one bit per physical tile PT0..PT255). When a VTG micro-op writes back, its `dst_ptag` sets the corresponding bit. When a VTG is dispatched, its source `ptag` bits are cleared.
+
+**VTG rotation scheduling:**
+
+```python
+while any VTG active in block:
+    winner = gviq.pick_oldest_ready()          # age = (rid - head_rid) mod 64
+    micro_op = buffer.lookup(winner.block_id, winner.pc_index)
+    SA = TRegFile.read(winner.src0_ptag)       # full 4 KB tile
+    SB = TRegFile.read(winner.src1_ptag)
+    SA_vtg = select_vtg(SA, winner.group_id, winner.group_mode)   # 256/512 B sub-range
+    result = vec_alu.execute(micro_op, SA_vtg, SB_vtg)
+    TRegFile.write_vtg(winner.dst_ptag, winner.group_id, result)
+    winner.pc_index++
+    if loop_end(winner): winner.iterN--, winner.pc_index = loop_start
+    if all_iters_done(winner): winner.valid = 0
+```
+
+**Issue rules:**
+
+| Rule | Description |
+|------|-------------|
+| GVIQ-1 | `pc_index <= pc_limit` for the given `block_id` |
+| GVIQ-2 | All source VTG `src_ready` bits set |
+| GVIQ-3 | Active loop counter (`iter*`) non-zero |
+| GVIQ-4 | GVIQ is 1-wide: one VTG micro-op per cycle |
+| GVIQ-5 | VEC-4K-v2 ALU is single-ported per VTG: one VTG per VEC beat |
+| GVIQ-6 | Paired `G256` issue (optional): two independent 256 B VTGs share one 512 B SIMD group beat if `{opcode, elem_type, pred_mode}` match |
+
 ### 7.6 Dispatch Stall Conditions
 
 | Condition | Recovery |
@@ -1526,6 +1719,82 @@ VEC-4K-v2 instructions are speculation-safe **inherently**: their only "external
 - VEC RS entries with `btag` in the misprediction's flush set are invalidated.
 - In-flight compute beats are flushed within 1 cycle (the staging-register state is overwritten by the next instruction's operand fetch).
 - Destination physical tiles (allocated at D2) are returned to the tile free list via free-list-head-pointer restore from the checkpoint.
+
+#### 8.3.10 VTG Vector Micro-Instruction Execution Mode (v2.2)
+
+> **(Change Point #2 — VTG / SIMD-group overlay)**
+
+The VEC-4K-v2 datapath supports two execution modes. **VTG operates behind VEC-4K-v2's staging registers** -- VTGs share SA/SB/SC with the full-tile path and do not introduce new staging structures or new TRegFile ports. VTG operands are sub-ranges of tiles that VEC-4K-v2 has already staged in SA/SB/SC via its 8-cycle operand-fetch prologue. VTG reads from SA/SB at the **ALU input mux** after the prologue completes.
+
+| Mode | Execution unit | VTG size | SIMD groups | TRegFile access |
+|------|---------------|----------|-------------|----------------|
+| **Full-tile `T*`** | One VEC tile op | 4 KB | Full epoch (8 cycles) | Full 4 KB read/write |
+| **VTG `V*` micro-op** | One VTG micro-op | 256 B or 512 B | 1 or 2 SIMD group beats | VTG sub-range via Group Read/Write Adapters. **VTG latency: 25-32 cy minimum** (8-15 cy prologue + 1 cy compute + 16 cy RMW writeback). VTG operates behind VEC-4K-v2 staging (SA/SB/SC) and reuses TRegFile ports (R0/R4/W0). |
+
+**VEC staging reuse for VTG micro-ops:**
+
+| Staging Register | VTG Micro-Op Use |
+|-----------------|-----------------|
+| `SA` | VEC-4K-v2 operand A staging (4 KB, filled by R0). VTG reads 256/512 B sub-range from SA at ALU input mux via Group Read Adapter. |
+| `SB` | VEC-4K-v2 operand B staging (4 KB, filled by R4). VTG reads 256/512 B sub-range from SB at ALU input mux. Scalar broadcast via SX/SY unchanged. |
+| `SC` | Predicate VTG (or third source VTG for wide ops) |
+| `SX / SY` | Scalar operand broadcast / loop counter broadcast |
+| `SOP` | VEC beat word from micro-instruction buffer (pre-decoded VEC beat-word sequence generated by VTG microassembler at decode time). One `VECBeatWord` drives VEC ALU for one cycle. |
+
+**SIMD lane mapping:**
+
+| Element type | Lanes per 512 B VTG | Lanes per 256 B VTG |
+|-------------|---------------------|---------------------|
+| FP32 / INT32 | **128** | 64 |
+| FP16 / BF16 | **256** | 128 |
+| FP8 | **512** | 256 |
+| FP4 | **1024** | 512 |
+
+**Group Read Adapter** (ALU input mux -- after prologue):
+
+```text
+input:  SA_full[4096 B] (from VEC prologue), SB_full[4096 B], group_id, group_mode
+G256:   vtg_A[256 B] = SA_full[group_id * 256 : (group_id+1) * 256]
+        vtg_B[256 B] = SB_full[group_id * 256 : (group_id+1) * 256]
+G512:   vtg_A[512 B] = SA_full[group_id * 512 : (group_id+1) * 512]
+        vtg_B[512 B] = SB_full[group_id * 512 : (group_id+1) * 512]
+output: vtg_A, vtg_B -> VEC ALU operand mux
+Note:  Group Read Adapter reads from SA/SB (4 KB), NOT directly from TRegFile.
+      VEC prologue fills SA/SB over 8-cycle epoch before this mux activates.
+```
+
+**Group Write Adapter** (VEC result -> TRegFile, full-tile RMW):
+
+```text
+input:  vtg_result[256/512 B], dst_ptag, group_id, group_mode
+
+// Step 1: Read full current tile (occupies W0 for 8 cycles)
+TRegFile.submit_read(dst_ptag)       -- occupies W0 for 8-cycle epoch --
+wait 8 cycles
+old_tile = TRegFile.read_data        -- 4 KB --
+
+// Step 2: Merge VTG result into correct sub-range
+if group_mode == G256:
+    start = group_id * 256; end = start + 256
+else:  -- G512 --
+    start = group_id * 512; end = start + 512
+new_tile = old_tile
+new_tile[start:end] = vtg_result     -- merge sub-range --
+
+// Step 3: Write merged tile back (occupies W0 for 8 cycles)
+TRegFile.submit_write(dst_ptag, new_tile)
+wait 8 cycles
+TRegFile.write_complete()
+
+-- Total RMW latency: 16 cycles minimum (8 read + 8 write) --
+// update VTG_metadata[dst_ptag][group_id] = {valid=1, defined=1, dirty=1}
+```
+
+> **Note:** TRegFile has no partial-write mechanism. All writes are full-tile, 512 B/cy x 8 cycles. The Group Write Adapter must read the current tile, merge the VTG sub-range, and write the full tile back. W0 is occupied for the full 16-cycle RMW cycle, blocking other tile writes.
+
+**Micro-instruction buffer integration:** At decode time, the VTG microassembler generates a pre-decoded `VECBeatWord` sequence for each VTG micro-op and writes it into the buffer. At P1/I1, `beat_word = buffer.lookup(block_id, pc_index)` drives VEC ALU for one cycle. The buffer lookup happens in parallel with the GVIQ pick -- both are 1-cycle combinational operations. The beat word is the same format as VEC-4K-v2's SOP beat word, enabling seamless integration with the existing VEC datapath without new microcode structures.
+
+**Paired `G256` issue (optional):** When two 256 B VTGs have matching `{opcode, elem_type, pred_mode}`, the VTG rotation scheduler may issue them together, filling the full 512 B SIMD group beat. GVIQ-6 and the VEC-domain arbiter must still resolve port conflicts (both VTGs need W0 for writeback).
 
 **No special speculation hardware is needed inside the vector unit.** The flush converges to a quiescent state in `T_fetch + max_beat_count` cycles in the worst case (a long-running `TINV` or `TMRGSORT` taking the full hit), but this is bounded by the number of in-flight vector ops (≤ 24 RS entries) and does not stall the front-end's recovery.
 
@@ -1897,6 +2166,314 @@ VEC-4K-v2 binding: **R0 (Port A, with `is_xpose_A`)**, **R4 (Port B, with `is_xp
 
 ---
 
+#### 8.3.11 Worked Examples: TSOFTMAX (Full-Tile ROM) and TSOFTMAX_VTG (VTG Variant)
+
+This section walks through two concrete instantiations of the same algorithm: (A) as a **full-tile VEC-4K-v2 instruction** driven by the microcode ROM, and (B) as a **VTG micro-instruction** driven by the micro-instruction buffer. Both execute the same five-pass TSOFTMAX algorithm; the difference is the scheduling context and where the beat-word sequence comes from.
+
+##### 8.3.11.1 Algorithm: TSOFTMAX Along the Row Axis
+
+For a tile shaped **8 x 128 FP32** (W = 512 B, R = 8), softmax along each row is:
+
+```
+Pass 1 -- row_max[i] = max(input[i][*])                              [col-reduce]
+Pass 2 -- diff[i][j]  = exp(input[i][j] - row_max[i])              [elementwise SUB + EXP]
+Pass 3 -- row_sum[i]  = SIGMA_j diff[i][j]                              [col-reduce]
+Pass 4 -- inv_sum[i]   = 1.0 / row_sum[i]                           [scalar RECIP]
+Pass 5 -- output[i][j] = diff[i][j] * inv_sum[i]                   [elementwise MUL]
+```
+
+##### 8.3.11.2 ROM Entry for Full-Tile TSOFTMAX
+
+The VEC-4K-v2 microcode ROM is keyed by `(opcode, format, W-regime, R-regime)`. The TSOFTMAX ROM entry for FP32, W = 512 B (one strip), R = 8 is:
+
+```
+ROM[TSOFTMAX, FP32, W=512B, R=8] --> {
+  ucode_base:  <addr>
+  ucode_len:   42    <-- 9+8+9+1+8+7 = 42 beats
+  shape:       (R=8, C=128, E=4, format=FP32)
+  N_strips:    8
+  elem_per_strip: 128  (512 B / 4 B)
+}
+```
+
+**VECBeatWord format** (from `vector4k_v2.md` SS5.4):
+
+```
+VECBeatWord {
+  src_A, src_B, src_Z : 3x3 b   <-- {SA, SB, SX, SY, ACC_LO, ACC_HI, IMM_ZERO, --}
+  s_A, s_B              : 2x3 b   <-- strip index 0..7
+  xp_A, xp_B            : 2x1 b   <-- 0 (row-mode; TSOFTMAX is purely row-axis)
+  mask_src               : 2 b     <-- {SC_mask, IMM_ALL_ONES, IMM_FROM_SOP}
+  mask_strip             : 3 b
+  alu_op                 : 5 b     <-- {ADD, SUB, MUL, MAX, PASS_A, RECIP, ...}
+  acc_op                 : 3 b     <-- {NONE, INIT, ACCUM, MERGE_STAGE, READOUT}
+  acc_slot               : 4 b     <-- 0..15
+  wr_en_D0, wr_en_D1    : 1 b each
+  wr_strip_D0, wr_strip_D1 : 3 b each
+}
+```
+
+##### 8.3.11.3 Beat-Word Sequence (Full-Tile TSOFTMAX, 42 Beats)
+
+```
+-- === PASS 1: row_max = max(input[i][*]) ===
+-- Beats 0-8: col-reduce via MAX on accumulator slot 0
+
+beat  0: INIT   src_A=SA, s_A=strip0,
+              src_B=ACC_LO, alu_op=PASS_A,
+              acc_op=INIT, acc_slot=0
+              -- acc[0] <-- SA[strip0] (128 FP32 elements)
+
+beats 1-7: ACCUM src_A=SA, s_A=strip[1..7],
+              src_B=ACC_LO, alu_op=MAX,
+              acc_op=ACCUM, acc_slot=0
+              -- acc[0] <-- MAX(acc[0], SA[strip_j]) pairwise
+
+beat  8: READOUT src_A=ACC_LO, alu_op=PASS_A,
+              acc_op=READOUT, acc_slot=0
+              -- broadcast row_max to all 128 lanes via SX
+
+-- === PASS 2: diff = exp(input - row_max) ===
+-- Beats 9-16: elementwise SUB, write to scratch tile T_scratch
+
+beats 9-16: src_A=SA, s_A=strip[0..7],
+              src_B=SX, alu_op=SUB,
+              mask_src=IMM_ALL_ONES,
+              acc_op=NONE,
+              wr_en_D0=1, wr_strip_D0=strip[0..7]
+              -- diff_strip[j] = SA[strip_j] - SX(row_max)
+              -- written to T_scratch via D0, one strip per beat
+              -- actual ROM folds SUB+EXP into a single EXP beat
+              -- with a preceding subtract (two beats per strip)
+
+-- === PASS 3: row_sum = SIGMA_j diff[i][j] ===
+-- Beats 17-25: col-reduce via ADD on accumulator slot 1
+
+beat 17: INIT   src_A=T_scratch, s_A=strip0,
+              src_B=ACC_LO, alu_op=PASS_A,
+              acc_op=INIT, acc_slot=1
+              -- acc[1] <-- T_scratch[strip0]
+
+beats 18-24: ACCUM src_A=T_scratch, s_A=strip[1..7],
+              src_B=ACC_LO, alu_op=ADD,
+              acc_op=ACCUM, acc_slot=1
+              -- acc[1] <-- ADD(acc[1], T_scratch[strip_j]) pairwise
+
+beat 25: READOUT src_A=ACC_LO, alu_op=PASS_A,
+              acc_op=READOUT, acc_slot=1
+              -- broadcast row_sum to all 128 lanes via SX
+
+-- === PASS 4: inv_sum = 1.0 / row_sum ===
+-- Beat 26: RECIP
+
+beat 26: src_A=SX, alu_op=RECIP,
+          acc_op=READOUT, acc_slot=1
+          -- inv_sum = RECIP(row_sum), broadcast via SY
+
+-- === PASS 5: output = diff * inv_sum ===
+-- Beats 27-34: elementwise MUL, retire to D0
+
+beats 27-34: src_A=T_scratch, s_A=strip[0..7],
+              src_B=SY, alu_op=MUL,
+              mask_src=IMM_ALL_ONES,
+              acc_op=NONE,
+              wr_en_D0=1, wr_strip_D0=strip[0..7]
+              -- out[strip_j] = T_scratch[strip_j] x SY(inv_sum)
+              -- retired to D0, one strip per beat
+
+-- === Finalize ===
+-- Beats 35-41: flush pending retire
+beats 35-41: wr_en_D0=1, wr_strip_D0=strip[0..7]
+
+Pipeline timing (full-tile TSOFTMAX):
+  Fetch prologue:     8 cycles  (TRegFile R0 + R4, 1 epoch)
+  Compute:           42 cycles  (5 passes)
+  Retire:             8 cycles  (W0, 1 epoch)
+  End-to-end:        ~58 cycles
+```
+
+##### 8.3.11.4 VTG Variant: TSOFTMAX_VTG
+
+The VTG variant operates on **one VTG at a time** (one 256 B sub-range of the tile in G256 mode). It **reuses the same ROM entry** -- the microassembler parameterizes the beat-word template for the VTG's group context at decode time and caches it in the micro-instruction buffer.
+
+**VTG GVIQ entry at dispatch (D1/D2):**
+
+```
+TSOFTMAX_F32 Td.gN, Ts.gM
+  gviq.push({
+    block_id:    allocate_micro_block(),   -- 12 b
+    pc_index:   0,
+    tile_group:  Td,           -- architectural tile
+    phys_tile:   PTd,           -- renamed via Tile RAT
+    group_id:    N,            -- VTG index gN
+    group_mode:   G256,         -- 256 B per VTG, 16 VTGs per tile
+    thread_id:   0,
+    iter0..iter3: loop counters,
+    active_lanes: 2048,        -- 256 B / 4 B per FP32
+    src0_ptag:   PTs,          -- source tile renamed via Tile RAT
+    src1_ptag:   PTs_scratch,  -- scratch tile renamed
+    dst_ptag:    PTd,          -- destination tile renamed
+    vtg_ready:   0,
+    branch_tag:  current_btag
+  })
+```
+
+**Microassembler at decode (D1/D2):**
+
+```
+-- Consult Tile Metadata RAT for source tile Ts --
+shape   = TileMetadataRAT[PTs].shape      -- (R=8, C=128)
+format  = TileMetadataRAT[PTs].format     -- = FP32
+W       = shape.C x E(format)              -- = 512 B
+R       = shape.R                          -- = 8
+
+-- Parameterize ROM entry for this VTG --
+-- G256 mode: tile split into 16 VTGs x 256 B each
+-- W=256B means: only 4 strips active (256 B / 512 B per strip)
+-- R=4 means:    4 rows, 4 strips
+-- Result: 26 beats instead of 42
+rom_key = (TSOFTMAX, format=FP32, W-regime=256B, R-regime=4)
+rom_entry = ROM.lookup(rom_key)
+
+for i in 0..25:
+    bw = rom_entry.beat_words[i]
+    bw.group_id       = N
+    bw.group_mode     = G256
+    bw.dst_ptag       = PTd
+    bw.src0_ptag      = PTs
+    bw.src1_ptag      = PTs_scratch
+    bw.output_range   = (N x 256, (N+1) x 256)
+    buffer.write(block_id=allocate_micro_block(), pc_index=i, beat_word=bw)
+```
+
+**GVIQ issue and execution (P1/I1):**
+
+```
+-- VTG rotation scheduler (one VTG at a time) --
+winner = gviq.pick_oldest_ready()     -- age = (rid - head_rid) mod 64
+bw     = buffer.lookup(winner.block_id, winner.pc_index)
+
+-- Wait for VEC prologue to fill SA/SB with full 4 KB tile --
+-- (VEC-4K-v2 operand-fetch prologue: 8 cycles)
+-- VTG sub-range selector: byte-mux from SA/SB (4 KB) to 256 B --
+SA_full  = TRegFile.read(winner.src0_ptag)    -- 8 cy epoch
+SB_full  = TRegFile.read(winner.src1_ptag)  -- 8 cy epoch (scratch tile)
+
+-- At I2 (after prologue): select VTG sub-range at ALU input mux --
+vtg_A = SA_full[winner.group_id x 256 : (winner.group_id+1) x 256]
+vtg_B = SB_full[winner.group_id x 256 : (winner.group_id+1) x 256]
+
+-- Drive VEC ALU with this beat word (1 cycle) --
+result = VEC_alu.execute(bw, vtg_A, vtg_B)
+
+-- Group Write Adapter: full-tile RMW --
+--   Step 1: read old tile (8 cy)
+--   Step 2: merge VTG sub-range (combinational)
+--   Step 3: write merged tile (8 cy)
+--   Total: 16 cy minimum
+submit_group_write(winner.dst_ptag, winner.group_id, result, 256)
+
+winner.pc_index++
+if winner.pc_index > 25:
+    winner.valid = 0       -- retire after beat 25
+```
+
+**Comparison: Full-Tile vs. VTG TSOFTMAX:**
+
+| Aspect | Full-Tile TSOFTMAX | VTG TSOFTMAX_VTG |
+|--------|---------------------|-------------------|
+| Input size | 4 KB (1024 FP32) | 256 B (64 FP32) per VTG |
+| ROM key | `(TSOFTMAX, FP32, W=512B, R=8)` | `(TSOFTMAX, FP32, W=256B, R=4)` |
+| Beat count | 42 | 26 |
+| VTG count | 1 (single tile) | 16 (loop over all VTGs via GVIQ) |
+| Prologue | 8 cy (full epoch) | 8 cy (shared with VEC) |
+| Writeback | 8 cy (full tile write) | 16 cy (full-tile RMW) |
+| Total per op | ~58 cy | ~50 cy + 16 cy RMW = ~66 cy per VTG |
+| Throughput | 1 tile / 58 cy | 1 VTG / 66 cy; 16 VTGs sequentially via GVIQ |
+
+**Key architectural points illustrated by this example:**
+
+1. **ROM is the source of truth.** Both full-tile and VTG TSOFTMAX execute beat-word sequences that originate from the same ROM entry. VTG microassembler parameterizes the template at decode time and caches it in the micro-instruction buffer; full-tile does a ROM lookup at issue time. No separate VTG microcode path is needed.
+
+2. **Prologue is shared.** VTG does not introduce a new operand-fetch path. It submits a tile read request through the same R0/R4 ports as VEC-4K-v2, and the 8-cycle prologue fills SA/SB. VTG then reads from the already-staged data at the ALU input mux.
+
+3. **Group Write Adapter RMW is the writeback tax.** Every VTG write must perform a full-tile read-modify-write: 8 cy to read the old tile, merge the VTG sub-range, 8 cy to write the merged tile. This 16-cycle overhead is amortized across all 16 VTGs.
+
+4. **GVIQ rotation schedules one VTG at a time.** After TSOFTMAX_VTG finishes one VTG (beat 25), the GVIQ scheduler picks the next ready VTG (or the same VTG's next iteration if iterN > 1). Loop counters in the GVIQ entry prefix drive strip-mined iterations without re-entering the GVIQ.
+
+5. **`format` from ROM = `format` from Tile Metadata RAT.** The microassembler reads `format` from the Tile Metadata RAT at decode time to select the correct ROM entry. No separate VTG `elem_type` field is needed -- confirming the metadata overlay design (SS9.2.5).
+
+---
+
+#### 9.2.5 VTG Sub-Unit and VTG Metadata Table (v2.2) VTG Sub-Unit and VTG Metadata Table (v2.2)
+
+> **(Change Point #2 -- hardware-revised)**
+
+Each 4 KB tile register is partitionable into **Vector Thread Groups (VTGs)** for SIMD-group execution. The VTG metadata **overlays the Tile Metadata RAT entry** (from §6.1) rather than being a separate table. The Tile Metadata RAT provides `shape.x`, `shape.y`, `format`; VTG-specific fields are added as extensions.
+
+**Unified metadata structure** (overlays Tile Metadata RAT):
+
+```text
+TileMetadataEntry (extended, 46+ b per physical tile):
+  -- From Tile Metadata RAT (§6.1):
+  shape.x:   14 b   -- columns C
+  shape.y:   14 b   -- rows R
+  format:     4 b   -- FP32/FP16/FP8/FP4 (same encoding as VTG elem_type -- NOT duplicated)
+  flags:      4 b   -- arg_tile, scalar_tile, prefetch_hint
+
+  -- VTG additions (overlay on Tile Metadata RAT):
+  group_mode:  1 b   -- G256=0, G512=1
+  pred_granule: 2 b  -- 8/16/32-bit lane grouping
+  -- Per-VTG validity (16 entries per tile, G256 mode):
+  vtg_meta[16]: {
+    valid:    1 b
+    defined:  1 b
+    dirty:    1 b
+    kind:     3 b   -- VEC | PRED | WIDE_LO | WIDE_HI | ALIGN_LD | SCRATCH | UNDEF
+  }
+```
+
+> **Note (v1.1 fix):** `elem_type` is NOT a separate VTG field -- it is the **same `format` field** from the Tile Metadata RAT. VTG uses `format` directly. `active_bytes` is computed from `shape.x x shape.y x E` and the VTG's position in the tile.
+
+**VTG byte mapping** (`G256` mode, 16 VTGs / tile):
+
+| VTG | Byte range | VTG | Byte range |
+|-----|-----------|-----|-----------|
+| `g0` | `[0, 255]` | `g8` | `[2048, 2303]` |
+| `g1` | `[256, 511]` | `g9` | `[2304, 2559]` |
+| `g2` | `[512, 767]` | `g10` | `[2560, 2815]` |
+| `g3` | `[768, 1023]` | `g11` | `[2816, 3071]` |
+| `g4` | `[1024, 1279]` | `g12` | `[3072, 3327]` |
+| `g5` | `[1280, 1535]` | `g13` | `[3328, 3583]` |
+| `g6` | `[1536, 1791]` | `g14` | `[3584, 3839]` |
+| `g7` | `[1792, 2047]` | `g15` | `[3840, 4095]` |
+
+In `G512` mode: `g0`=`[0,511]`, `g1`=`[512,1023]`, ..., `g7`=`[3584,4095]`.
+
+**VTG Metadata Table** (16 entries per physical tile):
+
+```text
+VTGMeta {
+  valid:        1 b,   // VTG contains defined data
+  kind:         3 b,   // VEC | PRED | WIDE_LO | WIDE_HI | ALIGN_LD | SCRATCH | UNDEF
+  group_mode:   1 b,   // G256=0, G512=1
+  elem_type:    4 b,   // FP32/FP16/FP8/FP4/INT32/...
+  active_bytes: 10 b,  // 0..256 (G256) or 0..512 (G512)
+  pred_granule: 2 b,  // 8/16/32-bit lane grouping
+  pred_mode:    1 b,   // 0=zeroing, 1=merging (default)
+  defined:      1 b,
+  dirty:        1 b,
+}
+```
+
+The VTG Metadata Table is read by the Group Read/Write Adapters to determine VTG validity and predicate granularity. It is updated on every VTG write.
+
+**Rename:** The Tile RAT maps architectural tile `Tg` -> physical tile `PT`. VTG `group_id` is a sub-location index into the renamed `PT`. A VTG micro-instruction writing `Tg.gN` may either update `PT.gN` in place (if uniquely owned and no older readers) or allocate a fresh physical tile and merge unchanged VTGs (copy-on-write policy, v1 conservative policy).
+
+**Writeback rename:** VTG writeback performs a full-tile read-modify-write (16 cy minimum, see §8.3.10). The destination `ptag` remains unchanged -- only the VTG sub-range content is modified. No Tile RAT update is needed at writeback; the `dirty` bit in `vtg_meta[dst_ptag][group_id]` is set.
+
+---
+
 ## 10. Out-of-Order Execution Model — Foundations
 
 > **(v1 → v2: 本章基础部分完整复制自 v1 §10。v2 增量为 Tile Metadata RAT(§10.3 引用)与 §10.6 指向 §11 的扩展投机恢复机制。)**
@@ -1911,7 +2488,9 @@ The Davinci-v2 core implements a **ROB-less out-of-order** execution model. Beca
 4. **Branch recovery via MapQ reverse replay.** On mispredict, the SMAP is restored to CMAP state by replaying MapQ entries in reverse order from the flush_rid. All younger instructions are flushed from physical IQs via branch_tag CAM-clear.
 5. **Physical registers freed by reference counting.** No ROB means no retirement-based freeing; instead, a ptag is freed when it is both *orphaned* (no longer mapped by SMAP) and its refcount reaches zero.
 6. **Ready Table provides O(1) ptag readiness.** The 128-bit Ready Table bitmap replaces the 384-entry CDB comparator array for scalar wakeup. Each ptag's readiness is a single bit-test.
-7. **Speculative memory side effects gated by branch tag.** Speculative scalar stores live in the SSB and speculative bulk tile stores live in the STQ until their `branch_tag` resolves to non-speculative. See Section 11.### 10.2 Instruction Lifecycle (BCC Scalar Pipeline)
+7. **Speculative memory side effects gated by branch tag.** Speculative scalar stores live in the SSB and speculative bulk tile stores live in the STQ until their `branch_tag` resolves to non-speculative. See Section 11.
+8. **(v2.3 Block-ROB 增量) Block-granularity precise exceptions via BROB.** The Block Reorder Buffer (BROB) tracks instruction blocks (BSTART to BSTOP) and provides precise exception identification: when a fault is detected, the faulting block is identified, younger blocks are squashed, and register state is recovered via MapQ reverse replay from the faulting RID. See SS11.11.
+8. **(v2.3 Block-ROB 增量) Block-granularity precise exceptions via BROB.** The Block Reorder Buffer (BROB) tracks instruction blocks (BSTART to BSTOP) and provides precise exception identification: when a fault is detected, the faulting block is identified, younger blocks are squashed, and register state is recovered via MapQ reverse replay from the faulting RID. See SS11.11.### 10.2 Instruction Lifecycle (BCC Scalar Pipeline)
 
 ```
   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌─────┐
@@ -1919,10 +2498,11 @@ The Davinci-v2 core implements a **ROB-less out-of-order** execution model. Beca
   │F0-F4│   │  D1  │   │D2  D3│   │ S1 S2│   │P1I1I2│  │E1-n│   │
   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘   └─────┘
                          │                                         │
-                    D1: RID/atag                            W1: Ready Table
-                    D2: SMAP read + ptag alloc              update + CDB
-                    D3: SMAP write + RT init                  broadcast
-                    + MapQ push
+                    D1: RID/atag + BROB entry alloc (BSTART)      W1: Ready Table
+                    D2: SMAP read + ptag alloc + MapQ push      update + CDB / TCB
+                    D3: SMAP write + RT init + BID stamp          broadcast
+                                                              + Block SSB/STQ transfer
+                                                              BROB Retire (off critical path)
 ```
 
 Detailed per-stage actions:
@@ -2031,7 +2611,40 @@ When the CDB broadcasts a result (ptag, data):
 2. **Physical RF write**: capture data at destination ptag
 3. **Tile Completion Bus (TCB)**: unchanged from v2, 4 ports, 8-bit tile tag
 
-TCB port allocation (unchanged from v2):### 10.5 Physical Register Freeing (Reference Counting)
+TCB port allocation (unchanged from v2):### 10.5.1 VTG Dependency and VTG-Ready Bits (v2.2)
+
+> **(Change Point #2 -- hardware-revised)**
+
+VTG vector micro-instructions have a two-level dependency model. VTG writeback is a **full-tile read-modify-write** (16 cy minimum), during which the destination tile's VTG ready bit is set only after writeback completion.
+
+| Level | Token | Purpose |
+|-------|-------|---------|
+| **Physical tile tag** | `ptag` (8 b) | Coarse readiness: entire tile is ready |
+| **VTG ready bit** | per-VTG sub-location bit in VTG Metadata Table | Fine readiness: specific VTG inside the tile is ready |
+
+The **VTG Ready Table** is a **256-bit bitmap** (one bit per physical tile PT0..PT255), similar in structure to the scalar Ready Table. It tracks tile-level writeback readiness. At VTG dispatch, the source `ptag` bits are cleared. At VTG writeback, the destination `ptag` bit is set.
+
+Inside the GVIQ, each entry's `src_ready` field tracks per-VTG readiness independently from tile-level readiness:
+
+```text
+vtg_ready = src_ready[0] & src_ready[1] & src_ready[2] & src_ready[3]
+           & loop_counters_ready
+```
+
+This two-level model allows a tile to contain some VTGs that are ready and others that are not — essential for warp-rotated scheduling where different VTGs are at different loop iterations.
+
+**VTG write policies:**
+
+| Policy | Trigger | Action |
+|--------|---------|--------|
+| In-place VTG write | Unique tile ownership, no older readers | Group Write Adapter reads old tile, merges VTG sub-range, writes merged tile. W0 occupied for 16 cy (RMW). |
+| Copy-on-write tile group | Shared tile or speculative update | Allocate fresh PT; Group Write Adapter reads old tile, merges all unchanged VTGs, writes to fresh PT. W0 occupied for 16 cy. |
+| Read-modify-write VTG | Merging predication | Fetch old destination VTG via Group Read Adapter; merge inactive lanes |
+| Fresh group define | Load or producer overwrites enough VTGs | Allocate fresh tile; mark all VTGs defined |
+
+**Scalar ordering without `VWAIT`:** No software-visible `VWAIT` instruction exists in v2.2. Ordering between VTG micro-ops and scalar ops is enforced by normal `ptag` / `src_ready` dependency tracking through the GVIQ.
+
+### 10.5 Physical Register Freeing (Reference Counting)
 
 > **(v1 -> v2 BCC: SMAP replaces Scalar RAT for the P-reg freeing path; Tile RAT unchanged. The refcount mechanism itself is identical to v1.)**
 
@@ -2106,7 +2719,9 @@ On a branch mispredict, the BCC scalar pipeline recovers via **MapQ reverse repl
   └────────────────────────────────────────────────────────────┘
 ```
 
-The MapQ replay is O(depth) = 12 iterations maximum. All recovery actions run in parallel within the single recovery cycle.## 11. Speculative Execution Recovery Without a Reorder Buffer
+The MapQ replay is O(depth) = 12 iterations maximum. All recovery actions run in parallel within the single recovery cycle.
+
+## 11. Speculative Execution Recovery Without a Reorder Buffer
 
 > **Question:** The v1 design eliminates the Reorder Buffer (ROB) by leveraging the no-precise-exception envelope, using the Reservation Station + reference-counting + RAT-checkpoint trio for OoO execution. v2 adds branch-prediction-driven **speculative execution** to extend the OoO window past unresolved branches. Can we do this safely — i.e., guarantee that a misspeculated path **never** corrupts architectural state — **without** introducing a ROB?
 >
@@ -2352,12 +2967,18 @@ These limitations are consistent with the v1 design envelope (run-to-completion 
 | Storage overhead | ROB ≈ 256 entries × ~150 b = ~5 KB + retirement logic | Branch-tag tracker (5 K gate) + SSB/STQ (~2.5 KB) + MapQ (144 B) + Ready Table (16 B) ≈ **~3 KB total** |
 | Wakeup logic | RS does dependency tracking; ROB independent | **Ready Table (128-bit bitmap) replaces CDB comparators**: 0 comparators vs. 384 for scalar RS; O(1) ptag lookup |
 | Mispredict penalty | ROB walk-back + flush ≈ 5–10 cy | **MapQ replay + Ready Table reset + IQ CAM-clear + SSB/STQ flush**: all parallel in 1 cy + 6-cy refill = 7 cy |
-| Precise exceptions | yes (free) | no (out of envelope) |
+| Precise exceptions | yes (free) | block-granularity via BROB (SS11.11) |
 | Single-thread TSO memory ordering | yes | yes (FIFO drain through SSB) |
 
 **The key insight:** in environments where precise exceptions are not required (the AI-kernel envelope), the ROB's three bundled services unbundle naturally. Service (1) is free if you don't need it. Service (3) is replaced by reference counting. Service (2) — **the only remaining service** — is implemented by the SSB + STQ + branch-tag tracker at a fraction of a ROB's cost.
 
+**v2.3 extends this:** by lifting exception handling to block granularity via BROB, the design achieves the ROB's service (1) for kernel-entry traps without a full flat ROB. The block boundary is the commit point; the faulting block is identified; younger blocks are squashed; MapQ reverse replay recovers register state to the faulting instruction.
+
+**v2.3 extends this:** by lifting exception handling to block granularity via BROB, the design achieves the ROB's service (1) for kernel-entry traps without a full flat ROB. The block boundary is the commit point; the faulting block is identified; younger blocks are squashed; MapQ reverse replay recovers register state to the faulting instruction.
+
 ### 11.9 Cycle-by-cycle example: speculative store followed by mispredict (BCC Scalar Pipeline)
+
+> **Block-ROB note:** This example uses the pre-BROB model. For cycle-by-cycle examples with BROB and block-level commit, see SS11.11.
 
 ```
   Cycle  Action
@@ -2410,9 +3031,313 @@ The mispredict is recovered in 7 total cycles. The MapQ replay runs in parallel 
 | Tile Metadata RAT (256 × 32 b SRAM) | unchanged | ~10 K |
 | **Total v2 BCC speculation hardware** | | **~113 K gate** |
 
+**v2.3 Block-ROB new hardware (added on top of v2 BCC):**
+
+| Block | Change | Gate count |
+|-------|--------|------------|
+| BROB (128 entries x ~120 b) | **new** | ~150 K |
+| Block SSB (32 entries x ~200 b) | **new** | ~60 K |
+| Block STQ (16 entries x ~100 b) | **new** | ~20 K |
+| BID tagging in iROB / GVIQ / IQ / SSB / STQ | **new** | ~8 K |
+| BROB allocate FSM + complete check | **new** | ~20 K |
+| Exception delivery logic | **new** | ~10 K |
+| **Total v2.3 Block-ROB hardware** | | **~268 K gate** |
+| **Total v2.3 with Block-ROB** | | **~381 K gate** |
+
+**v2.3 Block-ROB new hardware (added on top of v2 BCC):**
+
+| Block | Change | Gate count |
+|-------|--------|------------|
+| BROB (128 entries x ~120 b) | **new** | ~150 K |
+| Block SSB (32 entries x ~200 b) | **new** | ~60 K |
+| Block STQ (16 entries x ~100 b) | **new** | ~20 K |
+| BID tagging in iROB / GVIQ / IQ / SSB / STQ | **new** | ~8 K |
+| BROB allocate FSM + complete check | **new** | ~20 K |
+| Exception delivery logic | **new** | ~10 K |
+| **Total v2.3 Block-ROB hardware** | | **~268 K gate** |
+| **Total v2.3 with Block-ROB** | | **~381 K gate** |
+
 The v2 BCC speculation hardware is **~3.5%** of the ~3.26 mm² total core area — the same as v2 with RAT checkpoints. The Ready Table (~1 K gate) and MapQ (~1.5 K gate) add negligible area. The key win is the **CDB comparator elimination** (~50 K gate saved) and the **IQ split** (simpler, more scalable). The net gate count for the scalar wakeup/issue path is approximately equal or slightly lower than v1.
 
 ---
+
+## 11.11 Block-ROB -- Block-Granularity Precise Exception Support (v2.3 新增)
+
+### 11.11.1 Motivation
+
+The pre-BROB Davinci-v2 model explicitly excludes precise exception support, treating all faults as fatal. Block-ROB relaxes this to **block-granularity precise exceptions**:
+
+- The faulting instruction block is identified.
+- All younger blocks are squashed (BID-order flush).
+- Register state is recovered via MapQ reverse replay from the faulting RID.
+- Memory side effects within squashed blocks are discarded (SSB/STQ invalidation).
+- After OS/kernel handler restores context, the faulting block is re-executed.
+
+The block boundary (BSTART to BSTOP) is the commit point. This matches the design principle from LinxCore: block structure enables natural ROB-bounded commit without a flat instruction-level ROB.
+
+### 11.11.2 Instruction Block Definition
+
+An **instruction block** is a contiguous sequence of decoded micro-operations bounded by:
+
+- **BSTART** (inclusive start): first uop in the block; triggers BROB entry allocation.
+- **BSTOP** (inclusive end): last uop in the block; gates retirement.
+
+Block boundaries are compiler-generated at natural control-flow join points. Block size: 4-64 uops (typical AI kernel: 16-32 uops).
+
+**Block types:**
+
+| Block Type | Scalar-only | Engine-backed | Notes |
+|------------|-------------|---------------|-------|
+| `STD` | Yes | No | Pure scalar execution |
+| `VTG` | Yes | VTG micro-instructions | GVIQ sub-schedule within block |
+| `VEC` | No | Full-tile VEC-4K-v2 | `T*` tile operations |
+| `CUBE` | No | outerCube MXU | CUBE.OPA, CUBE.DRAIN |
+| `MTE` | Yes | Memory Tile Engine | TILE.LD, TILE.ST |
+
+### 11.11.3 Block ID (BID)
+
+Each block receives a **64-bit BID** at BSTART:
+
+```
+BID[7:0]  -- BROB slot index (0..127)
+BID[63:8] -- Monotonically increasing sequence number
+```
+
+The 8-bit slot index directly maps to the BROB entry. Full-width BID enables flush by ordering: **keep `bid <= flush_bid`, kill `bid > flush_bid`**.
+
+### 11.11.4 BROB Structure
+
+| Parameter | Value |
+|-----------|-------|
+| `BROB_ENTRIES` | 128 |
+| `BROB_ALLOC_PER_CYCLE` | 1 |
+| `BROB_COMPLETE_PER_CYCLE` | 1 |
+| `BROB_RETIRE_PER_CYCLE` | 1 |
+| `BID_W` | 8 b (slot) + 56 b (sequence) |
+
+**Per-BROB-entry state:**
+
+```
+BROBEntry {
+  valid:          1 b     -- entry is allocated
+  state:          2 b     -- ALLOC | ISSUED | COMPLETE
+  bid:            64 b    -- full-width Block ID
+  block_type:     4 b     -- STD | VTG | VEC | CUBE | MTE
+  head_rid:       7 b     -- RID of first uop (BSTART's iROB slot)
+  tail_rid:       7 b     -- RID of last uop (BSTOP's iROB slot)
+  n_uops:         6 b     -- number of uops in block (1..64)
+  checkpoint_id:   4 b     -- RAT checkpoint active for this block
+  needs_scalar:   1 b     -- block has scalar uops (BSTOP must retire)
+  needs_engine:   1 b     -- block has engine ops (GVIQ/Vector/Cube RS)
+  engine_done:     1 b     -- engine completion signal received
+  scalar_done:    1 b     -- BSTOP retired from iROB
+  has_exception:   1 b     -- exception detected within this block
+  exception_cause: 16 b    -- trap / exception cause code
+  fault_rid:       7 b     -- RID of faulting uop (if has_exception)
+  n_stores:        5 b     -- number of scalar stores in this block
+  n_vtg_ops:       5 b     -- number of VTG micro-instructions
+  block_ssb_base:  5 b     -- index into Block SSB RAM for first store
+  block_stq_base:  4 b     -- index into Block STQ RAM for first tile store
+}
+```
+
+**State machine:**
+
+```
+FREE --[allocate]--> ALLOC --[dispatched]--> ISSUED --[complete]--> COMPLETE
+                                                                   |
+                                                            [retire: advance head]
+                                                                   |
+                                                                  FREE
+```
+
+**Completion rule:**
+
+```
+complete = scalar_done && (needs_engine ? engine_done : 1)
+```
+
+### 11.11.5 Instruction Block Lifecycle
+
+**BSTART at D2:**
+1. Allocate BROB entry `k` from free pool (tail pointer).
+2. Set `bid = {seq_num++, k[7:0]}`.
+3. Set `block_type` from BSTART metadata.
+4. Set `checkpoint_id` = current RAT checkpoint snapshot.
+5. Set `head_rid` = current iROB head.
+6. Set `needs_scalar = 1`, `needs_engine = 0`, `scalar_done = 0`, `engine_done = 0`, `has_exception = 0`.
+7. Stamp all uops in block with `bid` (stored alongside `branch_tag` in IQ/GVIQ/iROB entries).
+8. BSTART retires immediately (bypasses IQ, EX, WB).
+
+**Subsequent uops (D3):**
+1. Allocate iROB entry; stamp `bid`.
+2. Set `iROB[rid].brob_slot = k`.
+3. Increment `n_uops`.
+4. If `is_store`: allocate Block SSB slot, increment `n_stores`.
+5. If `is_vtg_op`: increment `n_vtg_ops`; set `needs_engine = 1`.
+6. Execute normally through BCC pipeline.
+
+**BSTOP at D2:**
+1. Set `tail_rid` = current iROB entry index.
+2. Set `needs_engine = (n_vtg_ops > 0) || (block_type == VEC) || (block_type == CUBE)`.
+3. BSTOP enters iROB but **retirement is gated** (see below).
+
+### 11.11.6 BSTOP Retire Gate and Block Completion
+
+The iROB commit logic is extended with a **BSTOP retire gate**:
+
+```
+BSTOP can retire when ALL of:
+  1. BROB[bid_slot].state == COMPLETE
+  2. !BROB[bid_slot].has_exception
+
+On BSTOP retire:
+  1. Set scalar_done = 1 in BROB[bid_slot]
+  2. If complete && !has_exception: advance BROB head to k+1
+  3. If complete && has_exception: trigger exception delivery
+```
+
+**Engine completion:** Engines (VEC-4K-v2, Cube, MTE LSU, GVIQ) signal `engine_done` to the BROB via the existing TCB (Tile Completion Bus) with `bid` in the response. On match: `BROB[bid_slot].engine_done = 1`.
+
+### 11.11.7 Block Retire
+
+Only the **oldest block** (BROB head) retires per cycle:
+
+```
+1. If head.has_exception:
+     Report exception (see SS11.11.9)
+     Do NOT commit side effects
+     Squash all younger blocks (bid > head.bid)
+2. Else if head.state == COMPLETE:
+     Commit side effects:
+       a. Transfer Block SSB entries to SSB (drain_rdy = 1, btag = 0xFF)
+       b. Transfer Block STQ entries to STQ (drain_rdy = 1, btag = 0xFF)
+       c. Advance head pointer
+       d. Free BROB entry
+3. Else: stall (wait for completion)
+```
+
+### 11.11.8 Precise Exception Mechanism
+
+**Exception detection:**
+- **Scalar exception**: EX1 stage sets `iROB[rid].trap_valid = 1`.
+- **Engine exception**: TCB response arrives with `trap_valid=1`; BROB marks `has_exception=1`, `fault_rid=faulting_rid`.
+
+**Exception reporting flow:**
+
+```
+Step 1: Detection
+  Scalar: EX1 sets iROB[rid].trap_valid = 1
+  Engine: TCB arrives with trap_valid=1
+
+Step 2: Blocking
+  BROB does NOT retire the block
+  BSTOP retire is blocked (has_exception == TRUE)
+
+Step 3: Squash of Younger Blocks
+  flush_bid = BROB[head].bid
+  In parallel (1 cycle):
+    a. iROB: invalidate entries with bid > flush_bid
+    b. BROB: set valid = 0 for entries with bid > flush_bid
+    c. GVIQ: invalidate entries with bid > flush_bid
+    d. IQ: invalidate entries with bid > flush_bid
+    e. SSB: valid = 0 for entries with bid > flush_bid
+    f. STQ: valid = 0 for entries with bid > flush_bid
+    g. Block SSB: invalidate entries with bid > flush_bid
+    h. Block STQ: invalidate entries with bid > flush_bid
+
+Step 4: Register State Recovery
+  MapQ reverse replay from faulting RID backward:
+    for each MapQ entry from tail down to faulting RID:
+      undo SMAP write, restore orphan ptag, pop MapQ
+  Tile RAT: restore from BROB[head].checkpoint_id
+
+Step 5: Exception Delivery
+  EPC   = BSTART_PC (of faulting block)
+  Cause = BROB[head].exception_cause
+  Fault RID = BROB[head].fault_rid
+  OS/kernel handler restores context and re-executes the block.
+```
+
+**Within-block instruction precision:** MapQ already provides instruction-precise P-reg recovery. On exception, MapQ is replayed in reverse from `fault_rid` (captured at detection), not from the block boundary. The faulting uop is precisely identified and all younger uops in the same block are undone.
+
+### 11.11.9 Worked Example: Page Fault in Block
+
+```
+Block B: BSTART, u0 (ADD r1, r2, r3), u1 (TILE.LD), u2 (MUL r6, r4, r7), BSTOP
+
+u1 executes: TILE.LD triggers page fault.
+  LSU sets iROB[rid1].trap_valid = 1
+  LSU sets BROB[5].has_exception = 1
+  LSU sets BROB[5].fault_rid = rid1
+  LSU sets BROB[5].exception_cause = PAGE_FAULT
+
+BSTOP cannot retire (blocked on has_exception).
+Block B is at BROB head, blocked.
+
+Next cycle:
+  flush_bid = B.bid  (no younger blocks)
+  MapQ replay from rid1 backward:
+    undo SMAP writes from u1, u0
+    restore ptags for r4, r1
+  Tile RAT restore from checkpoint_id = 3
+  Deliver: EPC = BSTART_PC, Cause = PAGE_FAULT
+  OS handler restores context.
+  Block B is re-fetched and re-executed after handler returns.
+```
+
+### 11.11.10 Store Commit Within Blocks
+
+**Block SSB:** 32-entry structure shared across BROB entries. Each entry tracks a scalar store within a block.
+
+**Block SSB entry:**
+
+```
+valid:    1 b   -- entry is valid
+addr:    40 b   -- cache-line address (filled at EX1)
+data:    128 b -- store data (filled at EX2)
+size:     3 b   -- 1/2/4/8 B
+bid:      8 b   -- which block this store belongs to
+ssb_idx:  5 b   -- mapped SSB slot index
+```
+
+**Load forwarding within block:** Loads forward from Block SSB entries in the same block without BID ordering checks (Block SSB only contains stores from this block, which are already program-ordered).
+
+**Store commit at block retire:** All Block SSB entries for the retiring block are transferred to the SSB with `btag=0xFF` and `drain_rdy=1`. They drain to L1-D in program order via the existing SSB drain pump.
+
+**Block STQ:** Analogous to Block SSB for tile stores (TILE.ST, TILE.SCATTER). Tile data stays in TRegFile-4K; Block STQ holds the intent (address, source phys-tile, bid).
+
+### 11.11.11 Integration with Existing Infrastructure
+
+**MapQ:** Fully reused. Each renamed destination pushes a MapQ entry with `{arch_reg, old_ptag, new_ptag, RID, checkpoint_id}`. On exception, MapQ reverse replay from `fault_rid` recovers P-reg state. Unchanged.
+
+**Branch-tag tracker:** Fully reused. Each block receives a branch tag at BSTART. Branch-tag CAM-clear is extended to flush by `bid > flush_bid`. Unchanged.
+
+**RAT checkpoints:** Extended with `checkpoint_id` per BROB entry. On exception: Tile RAT restored from `BROB[head].checkpoint_id`. Scalar RAT recovered via MapQ reverse replay (already instruction-precise).
+
+**SSB/STQ:** Extended with `bid` field (8 b per entry). At D2: `SSB[idx].bid = current_bid`. At block retire: `SSB[idx].btag = 0xFF`, `drain_rdy = 1`. At flush: entries with `bid > flush_bid` are invalidated.
+
+**VTG / GVIQ:** GVIQ entries are stamped with `bid`. GVIQ issue is gated by `block_complete = (BROB[bid_slot].engine_done || !BROB[bid_slot].needs_engine)`. Unchanged GVIQ rotation scheduler.
+
+### 11.11.12 Flush Protocol Summary
+
+```
+flush_bid = BROB[head].bid
+
+In parallel (1 cycle):
+  a) iROB: invalidate entries with bid > flush_bid
+  b) BROB: valid = 0 for entries with bid > flush_bid; tail advances
+  c) GVIQ: invalidate entries with bid > flush_bid
+  d) IQ: invalidate entries with bid > flush_bid
+  e) SSB: valid = 0 for entries with bid > flush_bid
+  f) STQ: valid = 0 for entries with bid > flush_bid
+  g) Block SSB: invalidate entries with bid > flush_bid
+  h) Block STQ: invalidate entries with bid > flush_bid
+  i) MapQ: pop entries from flush_rid+1 backward (undo SMAP writes)
+  j) Tile RAT: restore from BROB[flush_bid_slot].checkpoint_id
+  k) Scalar RAT: flash-restore from checkpoint (unchanged)
+  l) Branch-tag tracker: free tags for flushed blocks
+```
 
 ## 12. Memory Subsystem
 
@@ -2495,6 +3420,47 @@ The MTE unit has a **high-bandwidth path** to the L2 cache (and external memory)
 The MTE unit exploits the large TRegFile-4K (256 tiles, 1 MB) as a **software-managed scratchpad**. Programmers (or compiler) schedule TILE.LD instructions well ahead of CUBE.OPA to hide memory latency. The 32-entry outstanding request buffer allows many tile loads to be in flight simultaneously, maximizing bandwidth utilization.
 
 **v2 增量:** `TILE.ST` and `TILE.SCATTER` traffic on this path is gated by the 8-entry STQ (§11.5).
+
+### 12.5.1 VTG Vector Load/Store (v2.2)
+
+> **(Change Point #2 -- hardware-revised)**
+
+VTG vector memory operations load or store 256 B or 512 B VTG payloads under predicate control. VTG memory ops share the LSU pipeline with MTE. VTG loads perform a full-tile RMW on writeback (16 cy minimum, same as ALU ops).
+
+**Vector Load:**
+
+```text
+VLD.F32  T8.g0, [Xbase + Xoff], T8.p0
+```
+
+Flow:
+1. Read loop/thread counters from GVIQ entry prefix (`iter0..iter3`)
+2. Compute effective address from scalar operands, immediate, and loop counters
+3. LSU fetches active lanes from memory (inactive lanes skipped)
+4. LSU builds 256 B or 512 B VTG payload
+5. LSU submits VTG payload to Group Write Adapter
+6. Group Write Adapter: full-tile RMW (16 cy minimum): read old tile, merge VTG payload into sub-range, write merged tile back
+7. Update VTG metadata for `T8.g0` (`valid=1`, `defined=1`, `dirty=1`, set after writeback complete)
+
+**Inactive-lane fault suppression:** VTG loads/stores MUST NOT fault for predicate-inactive lanes. The LSU checks `active_lanes` and the predicate VTG before performing address calculation for each lane. Faulting addresses in inactive lanes are suppressed and do not generate exceptions.
+
+**Vector Store:**
+
+```text
+VST.F32  T8.g2, [Xbase + Xoff], T8.p0
+```
+
+Inactive lanes MUST NOT write memory and MUST NOT fault for invalid inactive-lane addresses.
+
+**Strided and Gather:**
+
+| Instruction | Syntax | Operation |
+|-------------|--------|-----------|
+| `VLDSTRIDE` | `VLDSTRIDE.type Td, Xbase, Xstride, Xcount, Tp` | `Td[i] = mem[Xbase + i*Xstride]` |
+| `VSTSTRIDE` | `VSTSTRIDE.type Ts, Xbase, Xstride, Xcount, Tp` | `mem[Xbase + i*Xstride] = Ts[i]` |
+| `PGATHER` | `PGATHER.type Tpd, [Xbase + Ts*esize], Tp` | Predicate gather: `Tpd[i] = mem[Xbase + Ts[i]*esize]` |
+
+**Ordering within a VTG micro block:** Vector loads/stores inside the same micro block use conservative ordering (load after store with unknown alias requires a block boundary or fence). No `VWAIT` — ordering is handled by the existing scalar memory ordering model (§12.5).
 
 ### 12.5 Memory Ordering (v1 §11.5, 未变更; v2 增加 SSB 备注)
 
