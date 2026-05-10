@@ -429,32 +429,32 @@ Full cube ISA specification: see [`outerCube.md`](outerCube.md) §6. The Tile RA
 
 ### 2.4 TMA ISA (Tile Memory Access unit)
 
-> **本节参考 TMA (Tile Memory Access) 的设计，为原 MTE 指令空间中的 tile 访存操作提供具体格式与语义。§2.4.1 / §2.4.2 / §2.4.3 描述当前 ISA；§2.4.4 列明实现层增量。**
+> This section adopts the TMA (Tile Memory Access) design to provide concrete formats and semantics for the tile memory operations in the original MTE instruction space. §2.4.1 / §2.4.2 / §2.4.3 describe the current ISA; §2.4.4 lists v2 implementation-level additions visible to microarchitecture only.
 
 The TMA bridges three domains: **memory ↔ TRegFile-4K** (bulk tile transfers) and **scalar GPR ↔ TRegFile-4K** (single-element access). All TMA instructions flow through both the Scalar RAT and Tile RAT at rename.
 
-TMA 的四条核心访存指令分为两类：**TLOAD / TSTORE** 搬运连续内存块并支持布局变换，**MGATHER / MSCATTER** 按离散地址表进行 gather/scatter。
+TMA's four core memory-access instructions fall into two categories: **TLOAD / TSTORE** transfer contiguous memory blocks with optional layout transforms, and **MGATHER / MSCATTER** perform gather/scatter over a discrete address table.
 
-#### 关于分型布局（Fractal Layout, NZ / ZN）
+#### Fractal Layout (NZ / ZN)
 
-TMA 将 tile 内部数据划分为 **16 行 × 32 B** 的小块（fractal）。引入分型布局服务于矩阵乘法计算单元的数据消费模式：
+TMA partitions tile data into **16‑row × 32‑B** blocks (fractals). The fractal layout serves the data consumption pattern of the matrix-multiply compute unit:
 
-- **NZ** 用于左矩阵（A）：分型内行优先、分型间列优先
-- **ZN** 用于右矩阵（B）：分型内列优先、分型间行优先
+- **NZ** — left-matrix (A) format: row-major within a fractal, column-major across fractals
+- **ZN** — right-matrix (B) format: column-major within a fractal, row-major across fractals
 
-分型尺寸 512 B（16 行 × 32 B）与 TMA 内部数据通道 256 B RingTrans 对齐，两个 ring transaction 可完整搬运一个分型。
+The fractal size (512 B = 16 rows × 32 B) aligns with the TMA's internal 256‑B RingTrans data channel, so two ring transactions move one full fractal.
 
-术语说明：
-- **ND** — 行优先（Normal row-major，同行连续）
-- **DN** — 列优先（列连续）
-- **NZ** — 分型内行优先 + 分型间列优先
-- **ZN** — 分型内列优先 + 分型间行优先
+Terminology:
+- **ND** — Normal row-major (consecutive within a row)
+- **DN** — Normal column-major (consecutive within a column)
+- **NZ** — Row-major intra-fractal + column-major inter-fractal
+- **ZN** — Column-major intra-fractal + row-major inter-fractal
 
-##### ND2NZ 布局变换示意
+##### ND2NZ Layout Transform Illustration
 
-> 以下为 DOT 格式图，可粘贴至 [Graphviz 在线编辑器](https://dreampuf.github.io/GraphvizOnline/) 或 [Edotor](https://edotor.net/) 渲染查看。
+> The following is a DOT-format diagram. Paste it into [Graphviz Online Editor](https://dreampuf.github.io/GraphvizOnline/) or [Edotor](https://edotor.net/) to render.
 
-下图以 8×8 矩阵（分型 4×4 元素）为例，展示 ND（左）→ NZ（右）的变换效果。二维网格仅用于可视化——硬件中数据以格子内的数字为一维索引线性存放。右半 NZ 中，以四种底色标示四个分型块，分型内行优先、分型间列优先。同样一个元素（如原位于 ND 槽位 35 的元素）在 NZ 中被移到不同位置（槽位 19），意味着该元素在变换后归属于不同的分型块。
+The diagram shows an 8×8 matrix (fractal = 4×4 elements) before (ND, left) and after (NZ, right) the ND2NZ transform. The 2D grid is for visualisation only — in hardware, data is stored linearly by the numeric index shown in each cell.
 
 ```dot
 digraph ND2NZ {
@@ -633,7 +633,7 @@ digraph ND2NZ {
     >];
 
     nd -> nz_node [label="  ND2NZ", fontsize=16, fontcolor="#2E86C1", style="bold"];
-    label="ND2NZ 布局变换示意（8×8 矩阵，分型 4×4 元素）";
+    label="ND2NZ Layout Transform (8×8 matrix, 4×4-element fractal)";
     fontsize=13;
     fontcolor="#2C3E50";
 }
@@ -654,24 +654,24 @@ digraph ND2NZ {
 | TILE.ZERO | Td | Zero tile register Td |
 | TILE.COPY | Td, Ts | Copy tile Ts → Td (allocates new physical tile, copies data) |
 
-**TLOAD / TSTORE NORM**（Layout 省略时默认 NORM）语义与 v1 的 `TILE.LD` / `TILE.ST` 一致：以 4 KB tile 为单位在 TRegFile 与内存之间直接搬运。NORM 方式同时支持 contiguous 和 strided 两种变体。
+**TLOAD / TSTORE NORM** (NORM is the default when Layout is omitted) matches the original v1 `TILE.LD` / `TILE.ST` semantics: it transfers a 4 KB tile between TRegFile and memory as a contiguous block. NORM supports both contiguous and strided variants.
 
-**TLOAD.Layout / TSTORE.Layout** 扩展参数：
+**TLOAD.Layout / TSTORE.Layout** extended parameters:
 
-| 参数 | 说明 |
-|------|------|
-| Layout | NORM / ND2NZ / ND2ZN / DN2NZ / DN2ZN（TLOAD）；NORM / NZ2ND / ZN2ND（TSTORE） |
-| ValidCol, ValidRow | 实际搬运的有效数据行列数 |
-| Col | Tile 寄存器的总列数（≥ ValidCol） |
-| DataType | 元素数据类型 |
-| PadValue | 填充值（TLOAD, Null / Zero / Max / Min，超出有效区域的元素） |
-| BaseAddr | 内存起始地址 |
-| Stride | 两组数据间的字节间隔（可选，默认连续） |
-| DepSrc, DepDst | 依赖追踪（TMA 内部使用，对 ISA 层透明） |
+| Parameter | Description |
+|-----------|-------------|
+| Layout | NORM / ND2NZ / ND2ZN / DN2NZ / DN2ZN (TLOAD); NORM / NZ2ND / ZN2ND (TSTORE) |
+| ValidCol, ValidRow | Number of valid data columns/rows to transfer |
+| Col | Total columns in the destination/source tile register (≥ ValidCol) |
+| DataType | Element data type |
+| PadValue | Padding value for out-of-range elements (TLOAD, Null / Zero / Max / Min) |
+| BaseAddr | Memory base address |
+| Stride | Byte interval between consecutive data groups (optional, default = contiguous) |
+| DepSrc, DepDst | Dependency tracking tags (TMA-internal, transparent to ISA layer) |
 
-Layout=NORM 时，有效数据的行列数由 4 KB tile 的形状决定，与 v1 的 `TILE.LD` / `TILE.ST` 语义相同。
+When Layout=NORM, the valid row and column counts are determined by the 4 KB tile shape, identical to v1's `TILE.LD` / `TILE.ST` semantics.
 
-**MGATHER / MSCATTER** 的行为与 v1 的 `TILE.GATHER` / `TILE.SCATTER` 一致：遍历 offset tile 中的每个元素（uint16 偏移量），与 BaseAddr 相加得到实际内存地址，完成 gather / scatter 操作。MGATHER 读出数据连续写入 DstTile；MSCATTER 将 Ts_data 的数据写入对应内存地址。
+**MGATHER / MSCATTER** match v1's `TILE.GATHER` / `TILE.SCATTER` semantics: iterate over each element in the offset tile (uint16 offsets), add to BaseAddr to form the actual memory address, and complete the gather/scatter. MGATHER reads data and writes it contiguously into DstTile; MSCATTER writes Ts_data to the corresponding memory addresses.
 
 #### 2.4.2 Tile Manipulation Instructions
 
@@ -776,7 +776,7 @@ Key observations:
 
 After rename, TMA RS entries carry physical scalar register tags (from Scalar RAT) and physical tile tags (from Tile RAT). The TMA unit maintains a large outstanding request buffer to maximize memory-level parallelism.
 
-**Layout 形式的 TLOAD / TSTORE** 带额外参数（ValidCol, ValidRow, Col, DataType, PadValue 等），这些参数不通过 Scalar RAT rename 获取，而是作为指令的立即数或指令编码中的直接字段传递至 TMA。rename 层的 RAT 表行为与 NORM 形式一致（BaseAddr 过 Scalar RAT，DstTile/SrcTile 过 Tile RAT）。
+**Layout-form TLOAD/TSTORE** carry extended parameters (ValidCol, ValidRow, Col, DataType, PadValue, etc.) as instruction immediates or direct encoding fields passed to TMA — these are not obtained through Scalar RAT rename. The rename-stage RAT behaviour matches the NORM form (BaseAddr via Scalar RAT, DstTile/SrcTile via Tile RAT).
 
 #### 2.4.4 v2 实现层增量(对软件不可见)
 
