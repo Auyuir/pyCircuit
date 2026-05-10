@@ -427,24 +427,251 @@ Supported formats: FP16, BF16, FP8 (E4M3/E5M2), MXFP4, HiFP4. All accumulate int
 
 Full cube ISA specification: see [`outerCube.md`](outerCube.md) §6. The Tile RAT renames cube operands exactly as in v1; the outerCube MXU itself is unmodified between v1 and v2.
 
-### 2.4 MTE ISA (Memory Tile Engine)
+### 2.4 TMA ISA (Tile Memory Access unit)
 
-> **(v1 → v2: ISA 编码与语义 100% 兼容。以下 §2.4.1 / §2.4.2 / §2.4.3 完整复制自 v1 §2.4。v2 实现层增量列在本节末。)**
+> **本节参考 TMA (Tile Memory Access) 的设计，为原 MTE 指令空间中的 tile 访存操作提供具体格式与语义。§2.4.1 / §2.4.2 / §2.4.3 描述当前 ISA；§2.4.4 列明实现层增量。**
 
-The MTE bridges three domains: **memory ↔ TRegFile-4K** (bulk tile transfers) and **scalar GPR ↔ TRegFile-4K** (single-element access). All MTE instructions flow through both the Scalar RAT and Tile RAT at rename.
+The TMA bridges three domains: **memory ↔ TRegFile-4K** (bulk tile transfers) and **scalar GPR ↔ TRegFile-4K** (single-element access). All TMA instructions flow through both the Scalar RAT and Tile RAT at rename.
+
+TMA 的四条核心访存指令分为两类：**TLOAD / TSTORE** 搬运连续内存块并支持布局变换，**MGATHER / MSCATTER** 按离散地址表进行 gather/scatter。
+
+#### 关于分型布局（Fractal Layout, NZ / ZN）
+
+TMA 将 tile 内部数据划分为 **16 行 × 32 B** 的小块（fractal）。引入分型布局服务于矩阵乘法计算单元的数据消费模式：
+
+- **NZ** 用于左矩阵（A）：分型内行优先、分型间列优先
+- **ZN** 用于右矩阵（B）：分型内列优先、分型间行优先
+
+分型尺寸 512 B（16 行 × 32 B）与 TMA 内部数据通道 256 B RingTrans 对齐，两个 ring transaction 可完整搬运一个分型。
+
+术语说明：
+- **ND** — 行优先（Normal row-major，同行连续）
+- **DN** — 列优先（列连续）
+- **NZ** — 分型内行优先 + 分型间列优先
+- **ZN** — 分型内列优先 + 分型间行优先
+
+##### ND2NZ 布局变换示意
+
+> 以下为 DOT 格式图，可粘贴至 [Graphviz 在线编辑器](https://dreampuf.github.io/GraphvizOnline/) 或 [Edotor](https://edotor.net/) 渲染查看。
+
+下图以 8×8 矩阵（分型 4×4 元素）为例，展示 ND（左）→ NZ（右）的变换效果。二维网格仅用于可视化——硬件中数据以格子内的数字为一维索引线性存放。右半 NZ 中，以四种底色标示四个分型块，分型内行优先、分型间列优先。同样一个元素（如原位于 ND 槽位 35 的元素）在 NZ 中被移到不同位置（槽位 19），意味着该元素在变换后归属于不同的分型块。
+
+```dot
+digraph ND2NZ {
+    rankdir=LR;
+    node [shape=plaintext, fontname="sans-serif"];
+    splines=false;
+
+    nd [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="3">
+    <TR>
+        <TD ><FONT POINT-SIZE="10">0</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">1</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">2</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">3</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">4</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">5</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">6</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">7</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">8</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">9</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">10</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">11</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">12</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">13</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">14</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">15</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">16</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">17</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">18</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">19</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">20</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">21</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">22</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">23</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">24</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">25</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">26</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">27</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">28</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">29</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">30</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">31</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">32</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">33</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">34</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">35</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">36</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">37</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">38</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">39</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">40</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">41</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">42</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">43</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">44</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">45</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">46</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">47</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">48</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">49</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">50</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">51</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">52</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">53</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">54</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">55</FONT></TD>
+    </TR>
+    <TR>
+        <TD ><FONT POINT-SIZE="10">56</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">57</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">58</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">59</FONT></TD>
+        <TD  SIDES="L"><FONT POINT-SIZE="10">60</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">61</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">62</FONT></TD>
+        <TD ><FONT POINT-SIZE="10">63</FONT></TD>
+    </TR>
+    </TABLE>
+    >];
+
+    nz_node [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="3">
+    <TR>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">0</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">1</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">2</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">3</FONT></TD>
+        <TD BGCOLOR="#D6EAF8" SIDES="L"><FONT POINT-SIZE="10">32</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">33</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">34</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">35</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">4</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">5</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">6</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">7</FONT></TD>
+        <TD BGCOLOR="#D6EAF8" SIDES="L"><FONT POINT-SIZE="10">36</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">37</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">38</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">39</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">8</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">9</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">10</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">11</FONT></TD>
+        <TD BGCOLOR="#D6EAF8" SIDES="L"><FONT POINT-SIZE="10">40</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">41</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">42</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">43</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">12</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">13</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">14</FONT></TD>
+        <TD BGCOLOR="#D5F5E3"><FONT POINT-SIZE="10">15</FONT></TD>
+        <TD BGCOLOR="#D6EAF8" SIDES="L"><FONT POINT-SIZE="10">44</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">45</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">46</FONT></TD>
+        <TD BGCOLOR="#D6EAF8"><FONT POINT-SIZE="10">47</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">16</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">17</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">18</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">19</FONT></TD>
+        <TD BGCOLOR="#FCF3CF" SIDES="L"><FONT POINT-SIZE="10">48</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">49</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">50</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">51</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">20</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">21</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">22</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">23</FONT></TD>
+        <TD BGCOLOR="#FCF3CF" SIDES="L"><FONT POINT-SIZE="10">52</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">53</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">54</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">55</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">24</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">25</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">26</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">27</FONT></TD>
+        <TD BGCOLOR="#FCF3CF" SIDES="L"><FONT POINT-SIZE="10">56</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">57</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">58</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">59</FONT></TD>
+    </TR>
+    <TR>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">28</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">29</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">30</FONT></TD>
+        <TD BGCOLOR="#FADBD8"><FONT POINT-SIZE="10">31</FONT></TD>
+        <TD BGCOLOR="#FCF3CF" SIDES="L"><FONT POINT-SIZE="10">60</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">61</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">62</FONT></TD>
+        <TD BGCOLOR="#FCF3CF"><FONT POINT-SIZE="10">63</FONT></TD>
+    </TR>
+    </TABLE>
+    >];
+
+    nd -> nz_node [label="  ND2NZ", fontsize=16, fontcolor="#2E86C1", style="bold"];
+    label="ND2NZ 布局变换示意（8×8 矩阵，分型 4×4 元素）";
+    fontsize=13;
+    fontcolor="#2C3E50";
+}
+```
 
 #### 2.4.1 Bulk Tile Transfer Instructions
 
 | Instruction | Operands | Function |
 |-------------|----------|----------|
-| TILE.LD | Td, [Rbase] | Contiguous load: 4 KB from address Rbase → tile Td |
-| TILE.LD | Td, [Rbase], Rs | Strided load: rows at stride Rs → tile Td |
-| TILE.ST | [Rbase], Ts | Contiguous store: tile Ts → 4 KB at address Rbase |
-| TILE.ST | [Rbase], Ts, Rs | Strided store: tile Ts → rows at stride Rs |
-| TILE.GATHER | Td, [Rbase], Tidx | Gather: indexed load using index tile (element offsets in Tidx) |
-| TILE.SCATTER | [Rbase], Ts, Tidx | Scatter: indexed store using index tile (element offsets in Tidx) |
+| **TLOAD** | `Td, [BaseAddr]` | NORM load: 4 KB from BaseAddr → tile Td |
+| **TLOAD** | `Td, [BaseAddr], Stride` | NORM load: rows at stride Stride → tile Td |
+| **TLOAD** | `Layout, Params, DstTile(s), [BaseAddr, Stride]` | Layout load: memory → tile register(s) with optional ND2NZ/ND2ZN/DN2NZ/DN2ZN transform; supports padding and up to 8 tiles in parallel |
+| **TSTORE** | `[BaseAddr], Ts` | NORM store: tile Ts → 4 KB at BaseAddr |
+| **TSTORE** | `[BaseAddr], Ts, Stride` | NORM store: tile Ts → rows at stride Stride |
+| **TSTORE** | `Layout, Params, SrcTile(s), [BaseAddr, Stride]` | Layout store: tile register(s) → memory with optional NZ2ND/ZN2ND transform; supports up to 8 tiles in parallel |
+| **MGATHER** | `Td, Tidx, [BaseAddr]` | Gather: indexed load using offset tile Tidx → destination tile Td |
+| **MSCATTER** | `Ts_data, Ts_offsets, [BaseAddr]` | Scatter: indexed store using data tile Ts_data and offset tile Ts_offsets |
 | TILE.ZERO | Td | Zero tile register Td |
 | TILE.COPY | Td, Ts | Copy tile Ts → Td (allocates new physical tile, copies data) |
+
+**TLOAD / TSTORE NORM**（Layout 省略时默认 NORM）语义与 v1 的 `TILE.LD` / `TILE.ST` 一致：以 4 KB tile 为单位在 TRegFile 与内存之间直接搬运。NORM 方式同时支持 contiguous 和 strided 两种变体。
+
+**TLOAD.Layout / TSTORE.Layout** 扩展参数：
+
+| 参数 | 说明 |
+|------|------|
+| Layout | NORM / ND2NZ / ND2ZN / DN2NZ / DN2ZN（TLOAD）；NORM / NZ2ND / ZN2ND（TSTORE） |
+| ValidCol, ValidRow | 实际搬运的有效数据行列数 |
+| Col | Tile 寄存器的总列数（≥ ValidCol） |
+| DataType | 元素数据类型 |
+| PadValue | 填充值（TLOAD, Null / Zero / Max / Min，超出有效区域的元素） |
+| BaseAddr | 内存起始地址 |
+| Stride | 两组数据间的字节间隔（可选，默认连续） |
+| DepSrc, DepDst | 依赖追踪（TMA 内部使用，对 ISA 层透明） |
+
+Layout=NORM 时，有效数据的行列数由 4 KB tile 的形状决定，与 v1 的 `TILE.LD` / `TILE.ST` 语义相同。
+
+**MGATHER / MSCATTER** 的行为与 v1 的 `TILE.GATHER` / `TILE.SCATTER` 一致：遍历 offset tile 中的每个元素（uint16 偏移量），与 BaseAddr 相加得到实际内存地址，完成 gather / scatter 操作。MGATHER 读出数据连续写入 DstTile；MSCATTER 将 Ts_data 的数据写入对应内存地址。
 
 #### 2.4.2 Tile Manipulation Instructions
 
@@ -524,16 +751,16 @@ The transpose operates on **square sub-blocks** whose dimension equals the numbe
        funct3: element type
 ```
 
-Every MTE instruction flows through both the **Scalar RAT** (for address/data operands) and the **Tile RAT** (for tile operands) at the D2 rename stage:
+Every TMA instruction flows through both the **Scalar RAT** (for address/data operands) and the **Tile RAT** (for tile operands) at the D2 rename stage:
 
 | Instruction | Scalar RAT | Tile RAT source(s) | Tile RAT destination | Result bus |
 |-------------|-----------|---------------------|----------------------|------------|
-| TILE.LD Td, [Rbase] | Rbase → P-reg lookup | — | Td → allocate new PT | TCB |
-| TILE.LD Td, [Rbase], Rs | Rbase, Rs → P-reg lookups | — | Td → allocate new PT | TCB |
-| TILE.ST [Rbase], Ts | Rbase → P-reg lookup | Ts → PT lookup | — | — |
-| TILE.ST [Rbase], Ts, Rs | Rbase, Rs → P-reg lookups | Ts → PT lookup | — | — |
-| TILE.GATHER Td, [Rbase], Tidx | Rbase → P-reg lookup | Tidx → PT lookup | Td → allocate new PT | TCB |
-| TILE.SCATTER [Rbase], Ts, Tidx | Rbase → P-reg lookup | Ts, Tidx → PT lookups | — | — |
+| **TLOAD** Td, [BaseAddr] | BaseAddr → P-reg lookup | — | Td → allocate new PT | TCB |
+| **TLOAD** Td, [BaseAddr], Stride | BaseAddr, Stride → P-reg lookups | — | Td → allocate new PT | TCB |
+| **TSTORE** [BaseAddr], Ts | BaseAddr → P-reg lookup | Ts → PT lookup | — | — |
+| **TSTORE** [BaseAddr], Ts, Stride | BaseAddr, Stride → P-reg lookups | Ts → PT lookup | — | — |
+| **MGATHER** Td, Tidx, [BaseAddr] | BaseAddr → P-reg lookup | Tidx → PT lookup | Td → allocate new PT | TCB |
+| **MSCATTER** Ts_data, Ts_offsets, [BaseAddr] | BaseAddr → P-reg lookup | Ts_data, Ts_offsets → PT lookups | — | — |
 | TILE.ZERO Td | — | — | Td → allocate new PT | TCB |
 | TILE.COPY Td, Ts | — | Ts → PT lookup | Td → allocate new PT | TCB |
 | **TILE.MOVE Td, Ts** | — | Ts → PT lookup | **Td → alias PT(Ts)** (no alloc) | **— (rename-only)** |
@@ -547,12 +774,14 @@ Key observations:
 - **TILE.GET** produces a **scalar GPR result** (broadcast on CDB), while consuming a tile source. It requires both a Tile RAT source lookup and a Scalar RAT destination allocation.
 - **TILE.PUT** is a **read-modify-write** on the tile: the rename stage looks up the old physical tile mapping as a source AND allocates a new physical tile as a destination. The MTE unit copies the old tile contents to the new tile, then overwrites the single element.
 
-After rename, MTE RS entries carry physical scalar register tags (from Scalar RAT) and physical tile tags (from Tile RAT). The MTE unit maintains a large outstanding request buffer to maximize memory-level parallelism.
+After rename, TMA RS entries carry physical scalar register tags (from Scalar RAT) and physical tile tags (from Tile RAT). The TMA unit maintains a large outstanding request buffer to maximize memory-level parallelism.
+
+**Layout 形式的 TLOAD / TSTORE** 带额外参数（ValidCol, ValidRow, Col, DataType, PadValue 等），这些参数不通过 Scalar RAT rename 获取，而是作为指令的立即数或指令编码中的直接字段传递至 TMA。rename 层的 RAT 表行为与 NORM 形式一致（BaseAddr 过 Scalar RAT，DstTile/SrcTile 过 Tile RAT）。
 
 #### 2.4.4 v2 实现层增量(对软件不可见)
 
 1. **`TILE.TRANSPOSE` becomes a software-optional accelerator.** With per-port `is_transpose` on the TRegFile read (§9.2) and per-beat `tilelet_xpose` in the vector unit (§8.3), most "pre-transpose then consume" patterns become single-instruction with `is_xpose_*` set on the consuming op. `TILE.TRANSPOSE` is retained for cases that need a *materialized* transposed tile reused many times across instructions that themselves don't carry the bit; its physical staging buffer shrinks from 4 KB → 512 B (§8.5.1).
-2. **All bulk tile stores (`TILE.ST`, `TILE.SCATTER`) acquire a branch tag at dispatch** and are gated through the **Speculative Tile-Store Queue** (STQ, §11.5) until their tag becomes non-speculative. Invisible at the ISA level; adds 0–6 cycles of latency to a tile store on the speculative path.
+2. **All bulk tile stores (`TSTORE`, `MSCATTER`) acquire a branch tag at dispatch** and are gated through the **Speculative Tile-Store Queue** (STQ, §11.5) until their tag becomes non-speculative. Invisible at the ISA level; adds 0–6 cycles of latency to a tile store on the speculative path.
 
 ### 2.5 Instruction Domain Identification
 
@@ -563,7 +792,7 @@ The 7-bit opcode field encodes the instruction domain:
 | Opcode[6:5] | Domain | Decode path |
 |-------------|--------|-------------|
 | 00, 01 | Scalar | Scalar rename → Scalar RS |
-| 10 | Vector / MTE | Tile RAT rename → Vector RS or MTE RS |
+| 10 | Vector / TMA | Tile RAT rename → Vector RS or TMA RS |
 | 11 | Cube | Tile RAT rename → Cube RS |
 
 ---
