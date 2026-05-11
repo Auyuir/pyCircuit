@@ -442,7 +442,7 @@ TMA partitions tile data into **16‑row × 32‑B** blocks (fractals). The frac
 - **NZ** — left-matrix (A) format: row-major within a fractal, column-major across fractals
 - **ZN** — right-matrix (B) format: column-major within a fractal, row-major across fractals
 
-The fractal size (512 B = 16 rows × 32 B) aligns with the TMA's internal 256‑B RingTrans data channel, so two ring transactions move one full fractal.
+The fractal size (512 B = 16 rows × 32 B) aligns with the TMA's internal 512‑B data channel so one transaction moves a full fractal.
 
 Terminology:
 - **ND** — Normal row-major (consecutive within a row)
@@ -2122,8 +2122,7 @@ T requests are contiguous block transfers with optional fractal layout transform
   │                            │                                               │
   │                   ┌────────▼─────────┐                                     │
   │                   │  NWCB             │                                     │
-  │                   │  → Tile Reg via   │                                     │
-  │                   │  Ring (256 B/TX) │                                     │
+  │                   │  → Tile Reg (512 B/TX) │                                     │
   │                   └──────────────────┘                                     │
   └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -2151,18 +2150,18 @@ Three design choices make this possible:
 | Tag Pipe throughput | **1 request/cy** (target) |
 | Standard Tag | SRAM, set-associative, cacheline granularity |
 | Tile Tag | Registers, fully readable, 16-entry packed |
-| Ring transaction width | **256 B** (TRegFile ↔ TMA data path) |
+| TRegFile read/write width | **512 B** (TMA ↔ TRegFile data path) |
 | SoC memory interface | **64 B/cy** (1 cache line/cy) sustained |
 | Exchange network | **64 × 64** crossbar, **4 B** element granularity |
 | T request min split per BPQ entry | **≥16** sub-requests (one fractal = 16 rows × 32 B) |
 | M request max lanes per BPQ entry | **64** (after padding) |
 | Fractal size | **16 rows × 32 B** = **512 B** |
-| Tile size | **4 KB** (8 Ring transactions or 64 cache lines) |
+| Tile size | **4 KB** (8 transactions or 64 cache lines) |
 | Alloc-on-miss | Tag Pipe decides eviction at Tag time; BDB write on data return without re-tag |
 | Layout transform | Built into exchange network routing; no separate transpose buffer |
 | Per-RFB return data buffer saved | **~96 KB** (by alloc-on-miss vs alloc-on-fill) |
 
-#### 8.5.C TLOAD Lifecycle: from BPQ entry through Tag Pipe to Ring Transfer
+#### 8.5.C TLOAD Lifecycle: from BPQ entry through Tag Pipe to NWCB Transfer
 
 ```
   D2 (Rename):
@@ -2183,12 +2182,12 @@ Three design choices make this possible:
       ▸ Miss → allocate BDB + Tile Tag; split into 64 cacheline SRFB requests
                → SoC memory read (≈64 cycles from L2)
       ▸ Hit  → CAQ entry → read BDB continuously → exchange network
-               → NWCB → Tile Reg Ring (256 B/transaction)
+               → NWCB → Tile Reg (512 B/transaction)
 
-  Ring Transfer to Tile Reg (8 write epochs):
-    For each Ring transaction (2 per fractal = 16 transactions):
-      NWCB → RingTrans (256 B) → TRegFile write port
-    Total: 2 RingTX × 8 fractals = 16 × 256 B = 4 KB
+  Transfer to Tile Reg (8 write epochs):
+    For each transaction (2 per fractal = 8 transactions):
+      NWCB → 512 B → TRegFile write port
+    Total: 8 × 512 B = 4 KB
 
   Complete:
     Tile RAT ready[PT200] ← 1
@@ -2196,7 +2195,7 @@ Three design choices make this possible:
     Decrement tile refcount for any source tiles
 ```
 
-TMA bulk operations incur both **memory access latency** and **Ring transfer latency**. For fractal TLOAD, the TMA first fetches data from SoC memory (64 cache lines at 64 B/cy), buffers through BDB and the exchange network for layout transform, then transfers to TRegFile via Ring (256 B/transaction, 16 transactions per tile). For TSTORE, the TMA first reads the source tile from TRegFile via Ring, converts fractal→contiguous through the exchange network, and writes to SoC memory.
+TMA bulk operations incur both **memory access latency** and **NWCB transfer latency**. For fractal TLOAD, the TMA first fetches data from SoC memory (64 cache lines at 64 B/cy), buffers through BDB and the exchange network for layout transform, then transfers to TRegFile (512 B/transaction, 8 transactions per tile). For TSTORE, the TMA first reads the source tile from TRegFile, converts fractal→contiguous through the exchange network, and writes to SoC memory.
 
 #### 8.5.D TILE.GET / TILE.PUT Execution Flow (Element Access) — (v1 §8.5.4, 未变更)
 
@@ -3098,7 +3097,7 @@ Key differences from SSB:
 
 - **Data does not reside in the STQ.** The 4 KB tile payload stays in TRegFile-4K, referenced by `tile_phys_idx`. The STQ holds only the *intent* (address, layout, source phys-tile, branch tag). The actual data transfer occurs when the STQ drains to TMA.
 - **Smaller capacity (8 entries).** Bulk tile stores are infrequent compared to scalar stores.
-- **Drain triggers a memory-bound transfer through TMA.** Unlike a single-cycle SSB drain, STQ drains involve an 8-cy TRegFile read epoch, a Ring-transfer to TMA, and a ~64 cy memory write path, but these overlap with subsequent operations.
+- **Drain triggers a memory-bound transfer through TMA.** Unlike a single-cycle SSB drain, STQ drains involve an 8-cy TRegFile read epoch, a TMA transfer, and a ~64 cy memory write path, but these overlap with subsequent operations.
 
 #### 11.5.1 Allocation, drain, invalidation
 
@@ -3108,7 +3107,7 @@ The flow mirrors §11.4.1–§11.4.4 with these TMA-specific adaptations:
   Allocation:     D2 of TSTORE or MSCATTER → STQ slot
   Population:     at TMA issue, fields {base_addr, layout, tile_phys_idx, branch_tag} fill in
   Drain:          when btag becomes non-speculative, drain_rdy ← 1; oldest drain_rdy entry
-                  begins TRegFile read epoch → Ring transfer to TMA
+                  begins TRegFile read epoch → transfers to TMA
                   → TMA's BPQ splits into sub-requests → BDB buffers Tile Reg data
                   → Exchange Network (fractal→contiguous transform) → SWCB → SoC memory
                   → on memory completion, TMA notifies BROB and records the address
@@ -3667,7 +3666,7 @@ TLOAD / TSTORE / MGATHER / MSCATTER instructions share the **BCC LSU's LDQ and S
 **TSTORE path through BCC LSU:**
 1. BISQ dispatches TSTORE; E3 queries STQ, SCB, and LDQ for conflicts
 2. If no younger LDQ conflict: enters STQ and immediately sends resolve to BROB
-3. STQ oldest entry (non-speculative) → drain: 8-cy TRegFile read epoch → Ring transfer to TMA
+3. STQ oldest entry (non-speculative) → drain: 8-cy TRegFile read epoch → TMA transfer
 4. TMA processes the store (Exchange Network fractal→contiguous → BDB → SWCB → SoC memory)
 5. After TMA completes the store → address recorded in **TSRQ** for subsequent load conflict detection
 6. TSRQ entry held until the store is fully ordered in memory; only then dequeued, waking any loads that slept on this address
